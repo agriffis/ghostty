@@ -55,7 +55,9 @@ zig build \
     -Demit-docs
 
 # Find the files because manually listing them is boring.
-find %{_bindir} %{_datadir} -path %{_datadir}/ghostty -prune -o -type f > files
+find "%{buildroot}" -type f | \
+sed 's,^%{buildroot},,' | \
+grep -v '^%{_datadir}/ghostty/' > files
 
 %files -f files
 %license LICENSE
