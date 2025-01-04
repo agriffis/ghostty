@@ -1,0 +1,63 @@
+#!/bin/bash
+
+# backward compat since cached function went away
+# https://pagure.io/rpkg-util/c/bb62554c62fd52224709e861c2353a5c15b50220?branch=main
+function cached {
+  declare v=${OUTPUT[$1]}
+  [[ -n $v ]] && echo -n "$v"
+}
+
+function git_version {
+  cached git_version && return
+
+  # git describe --first-parent origin/main
+  # tip-0-g8f5f432a
+  declare describe tag commits hash _
+  describe=$(git describe --first-parent --long origin/main)
+  read tag commits hash <<<"${describe//-/ }"
+  if [[ $tag == tip ]]; then
+    # v1.0.1-56-g1baf8928
+    describe=$(git describe --first-parent --long origin/main^)
+    read tag commits _ <<<"${describe//-/ }"
+    tag=${describe%%-*}
+    commits=$(( commits + 1 ))
+  fi
+  [[ $tag == v* && $commits =~ ^[0-9]+$ && -n $hash ]] || abort "failed git describe"
+
+  # https://docs.fedoraproject.org/en-US/packaging-guidelines/Versioning/#_snapshots
+  # ^ because this is a post-release snapshot
+  # $commits so there's an increasing sequence number
+  output "${tag#v}^$commits.$hash"
+}
+
+function git_revision {
+  cached git_revision && return
+
+  # find last merge
+  declare last_merge rest
+  read last_merge rest <<<"$(git log --merges --oneline -n1)"
+  [[ -n $last_merge ]] || abort "failed to find last merge"
+
+  # count commits since last merge, might be zero
+  declare count
+  count=$(git log --oneline HEAD "^$last_merge" | wc -l)
+
+  output "$((count + 1))"
+}
+
+function git_changelog_date {
+  cached git_changelog_date && return
+  output "$(date +'%a %b %d %Y')"
+}
+
+function git_changelog_version {
+  cached git_changelog_version && return
+  git_version &>/dev/null  # cache
+  git_revision &>/dev/null # cache
+  output "$(git_version)-$(git_revision)"
+}
+
+function abort {
+  echo "ABORT: $*" >&2
+  exit 1
+}

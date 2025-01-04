@@ -1,0 +1,66 @@
+# vim:ft=spec:
+
+Name:           {{{git_name name="ghostty"}}}
+Version:        {{{git_version}}}
+Release:        {{{git_revision}}}%{?dist}
+Summary:        GPU-accelerated terminal with GTK4 UI
+
+License:        MIT
+URL:            https://github.com/ghostty-org/ghostty
+Source0:        {{{git_repo_pack}}}
+
+BuildRequires: fontconfig-devel
+BuildRequires: freetype-devel
+BuildRequires: glib2-devel
+BuildRequires: gtk4-devel
+BuildRequires: harfbuzz-devel
+BuildRequires: libadwaita-devel
+BuildRequires: libpng-devel
+BuildRequires: oniguruma-devel
+BuildRequires: pandoc-cli
+BuildRequires: pixman-devel
+BuildRequires: pkg-config
+BuildRequires: zig
+BuildRequires: zlib-ng-devel
+
+Requires: fontconfig
+Requires: freetype
+Requires: glib2
+Requires: gtk4
+Requires: harfbuzz
+Requires: libadwaita
+Requires: libpng
+Requires: oniguruma
+Requires: pixman
+Requires: zlib-ng
+
+%description
+Ghostty is a fast, feature-rich, and cross-platform terminal emulator that uses
+platform-native UI and GPU acceleration.
+
+%prep
+{{{git_setup_macro path="$GIT_ROOT"}}}
+
+%build
+# Replace the caret in the rpm version with something that doesn't break Zig.
+v="%{version}-%{release}"
+v="${v/^/+}"
+zig build \
+    --summary all \
+    --prefix "%{buildroot}%{_prefix}" \
+    -Dversion-string="$v" \
+    -Doptimize=ReleaseFast \
+    -Dcpu=baseline \
+    -Dpie=true \
+    -Demit-docs
+
+# Find the files because manually listing them is boring.
+find %{_bindir} %{_datadir} -path %{_datadir}/ghostty -prune -o -type f > files
+
+%files -f files
+%license LICENSE
+%{_datadir}/ghostty
+
+%changelog
+* {{{git_changelog_date}}} Aron Griffis <aron@scampersand.com> - {{{git_changelog_version}}}
+- Nightly build from git master
