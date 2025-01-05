@@ -610,6 +610,10 @@ palette: Palette = .{},
 /// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
 @"unfocused-split-fill": ?Color = null,
 
+/// The color of the split divider. If this is not set, a default will be chosen.
+/// Specified as either hex (`#RRGGBB` or `RRGGBB`) or a named X11 color.
+@"split-divider-color": ?Color = null,
+
 /// The command to run, usually a shell. If this is not an absolute path, it'll
 /// be looked up in the `PATH`. If this is not set, a default will be looked up
 /// from your system. The rules for the default lookup are:
@@ -1073,7 +1077,10 @@ keybind: Keybinds = .{},
 
 /// The font that will be used for the application's window and tab titles.
 ///
-/// This is currently only supported on macOS.
+/// If this setting is left unset, the system default font will be used.
+///
+/// Note: any font available on the system may be used, this font is not
+/// required to be a fixed-width font.
 @"window-title-font-family": ?[:0]const u8 = null,
 
 /// The theme to use for the windows. Valid values:
