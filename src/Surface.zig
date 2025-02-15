@@ -531,6 +531,7 @@ pub fn init(
         var io_exec = try termio.Exec.init(alloc, .{
             .command = command,
             .env = env,
+            .env_override = config.env,
             .shell_integration = config.@"shell-integration",
             .shell_integration_features = config.@"shell-integration-features",
             .working_directory = config.@"working-directory",
@@ -4023,6 +4024,12 @@ pub fn performBindingAction(self: *Surface, action: input.Binding.Action) !bool 
             size.points = self.config.original_font_size;
             try self.setFontSize(size);
         },
+
+        .prompt_surface_title => return try self.rt_app.performAction(
+            .{ .surface = self },
+            .prompt_title,
+            {},
+        ),
 
         .clear_screen => {
             // This is a duplicate of some of the logic in termio.clearScreen
