@@ -2075,9 +2075,11 @@ keybind: Keybinds = .{},
 
 /// The color of the screen in the macOS app icon.
 ///
-/// The screen is a gradient so you can specify multiple colors that
-/// make up the gradient. Comma-separated colors may be specified as
-/// as either hex (`#RRGGBB` or `RRGGBB`) or as named X11 colors.
+/// The screen is a linear gradient so you can specify multiple colors
+/// that make up the gradient. Up to 64 comma-separated colors may be
+/// specified as either hex (`#RRGGBB` or `RRGGBB`) or as named X11
+/// colors. The first color is the bottom of the gradient and the last
+/// color is the top of the gradient.
 ///
 /// Note: This configuration is required when `macos-icon` is set to
 /// `custom-style`.
@@ -4204,14 +4206,16 @@ pub const Color = struct {
 
     pub fn parseCLI(input_: ?[]const u8) !Color {
         const input = input_ orelse return error.ValueRequired;
+        // Trim any whitespace before processing
+        const trimmed = std.mem.trim(u8, input, " \t");
 
-        if (terminal.x11_color.map.get(input)) |rgb| return .{
+        if (terminal.x11_color.map.get(trimmed)) |rgb| return .{
             .r = rgb.r,
             .g = rgb.g,
             .b = rgb.b,
         };
 
-        return fromHex(input);
+        return fromHex(trimmed);
     }
 
     /// Deep copy of the struct. Required by Config.
@@ -4299,6 +4303,18 @@ pub const Color = struct {
         try color.formatEntry(formatterpkg.entryFormatter("a", buf.writer()));
         try std.testing.expectEqualSlices(u8, "a = #0a0b0c\n", buf.items);
     }
+
+    test "parseCLI with whitespace" {
+        const testing = std.testing;
+        try testing.expectEqual(
+            Color{ .r = 0xAA, .g = 0xBB, .b = 0xCC },
+            try Color.parseCLI(" #AABBCC   "),
+        );
+        try testing.expectEqual(
+            Color{ .r = 0, .g = 0, .b = 0 },
+            try Color.parseCLI("  black "),
+        );
+    }
 };
 
 pub const ColorList = struct {
@@ -4338,7 +4354,9 @@ pub const ColorList = struct {
             count += 1;
             if (count > 64) return error.InvalidValue;
 
-            const color = try Color.parseCLI(raw);
+            // Trim whitespace from each color value
+            const trimmed = std.mem.trim(u8, raw, " \t");
+            const color = try Color.parseCLI(trimmed);
             try self.colors.append(alloc, color);
             try self.colors_c.append(alloc, color.cval());
         }
@@ -4407,6 +4425,14 @@ pub const ColorList = struct {
         try p.parseCLI(alloc, "black,white");
         try testing.expectEqual(2, p.colors.items.len);
 
+        // Test whitespace handling
+        try p.parseCLI(alloc, "black, white"); // space after comma
+        try testing.expectEqual(2, p.colors.items.len);
+        try p.parseCLI(alloc, "black , white"); // spaces around comma
+        try testing.expectEqual(2, p.colors.items.len);
+        try p.parseCLI(alloc, " black , white "); // extra spaces at ends
+        try testing.expectEqual(2, p.colors.items.len);
+
         // Error cases
         try testing.expectError(error.ValueRequired, p.parseCLI(alloc, null));
         try testing.expectError(error.InvalidValue, p.parseCLI(alloc, " "));
@@ -4444,7 +4470,14 @@ pub const Palette = struct {
         const eqlIdx = std.mem.indexOf(u8, value, "=") orelse
             return error.InvalidValue;
 
-        const key = try std.fmt.parseInt(u8, value[0..eqlIdx], 0);
+        // Parse the key part (trim whitespace)
+        const key = try std.fmt.parseInt(
+            u8,
+            std.mem.trim(u8, value[0..eqlIdx], " \t"),
+            0,
+        );
+
+        // Parse the color part (Color.parseCLI will handle whitespace)
         const rgb = try Color.parseCLI(value[eqlIdx + 1 ..]);
         self.value[key] = .{ .r = rgb.r, .g = rgb.g, .b = rgb.b };
     }
@@ -4521,6 +4554,27 @@ pub const Palette = struct {
         var list: Self = .{};
         try list.formatEntry(formatterpkg.entryFormatter("a", buf.writer()));
         try std.testing.expectEqualSlices(u8, "a = 0=#1d1f21\n", buf.items[0..14]);
+    }
+
+    test "parseCLI with whitespace" {
+        const testing = std.testing;
+
+        var p: Self = .{};
+        try p.parseCLI("0 =  #AABBCC");
+        try p.parseCLI(" 1= #DDEEFF    ");
+        try p.parseCLI("  2  =  #123456 ");
+
+        try testing.expect(p.value[0].r == 0xAA);
+        try testing.expect(p.value[0].g == 0xBB);
+        try testing.expect(p.value[0].b == 0xCC);
+
+        try testing.expect(p.value[1].r == 0xDD);
+        try testing.expect(p.value[1].g == 0xEE);
+        try testing.expect(p.value[1].b == 0xFF);
+
+        try testing.expect(p.value[2].r == 0x12);
+        try testing.expect(p.value[2].g == 0x34);
+        try testing.expect(p.value[2].b == 0x56);
     }
 };
 
