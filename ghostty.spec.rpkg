@@ -9,6 +9,7 @@ License:        MIT
 URL:            https://github.com/ghostty-org/ghostty
 Source0:        {{{git_repo_pack}}}
 
+BuildRequires: blueprint-compiler
 BuildRequires: fontconfig-devel
 BuildRequires: freetype-devel
 BuildRequires: glib2-devel
