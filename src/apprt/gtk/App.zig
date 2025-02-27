@@ -10,6 +10,12 @@
 /// (event loop) along with any global app state.
 const App = @This();
 
+const gtk = @import("gtk");
+const gio = @import("gio");
+const glib = @import("glib");
+const gobject = @import("gobject");
+const adw = @import("adw");
+
 const std = @import("std");
 const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
@@ -66,11 +72,6 @@ clipboard_confirmation_window: ?*ClipboardConfirmationWindow = null,
 
 /// This is set to false when the main loop should exit.
 running: bool = true,
-
-/// If we should retry querying D-Bus for the color scheme with the deprecated
-/// Read method, instead of the recommended ReadOne method. This is kind of
-/// nasty to have as struct state but its just a byte...
-dbus_color_scheme_retry: bool = true,
 
 /// The base path of the transient cgroup used to put all surfaces
 /// into their own cgroup. This is only set if cgroups are enabled
@@ -1256,9 +1257,22 @@ pub fn run(self: *App) !void {
         self.transient_cgroup_base = path;
     } else log.debug("cgroup isolation disabled config={}", .{self.config.@"linux-cgroup"});
 
-    // Setup our D-Bus connection for listening to settings changes,
-    // and asynchronously request the initial color scheme
-    self.initDbus();
+    // Setup color scheme notifications
+    const adw_app: *adw.Application = @ptrCast(@alignCast(self.app));
+    const style_manager: *adw.StyleManager = adw_app.getStyleManager();
+    _ = gobject.Object.signals.notify.connect(
+        style_manager,
+        *App,
+        adwNotifyDark,
+        self,
+        .{
+            .detail = "dark",
+        },
+    );
+
+    // Make an initial request to set up the color scheme
+    const light = style_manager.getDark() == 0;
+    self.colorSchemeEvent(if (light) .light else .dark);
 
     // Setup our actions
     self.initActions();
@@ -1290,42 +1304,6 @@ pub fn run(self: *App) !void {
 
         if (must_quit) self.quit();
     }
-}
-
-fn initDbus(self: *App) void {
-    const dbus = c.g_application_get_dbus_connection(@ptrCast(self.app)) orelse {
-        log.warn("unable to get dbus connection, not setting up events", .{});
-        return;
-    };
-
-    _ = c.g_dbus_connection_signal_subscribe(
-        dbus,
-        null,
-        "org.freedesktop.portal.Settings",
-        "SettingChanged",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.appearance",
-        c.G_DBUS_SIGNAL_FLAGS_MATCH_ARG0_NAMESPACE,
-        &gtkNotifyColorScheme,
-        self,
-        null,
-    );
-
-    // Request the initial color scheme asynchronously.
-    c.g_dbus_connection_call(
-        dbus,
-        "org.freedesktop.portal.Desktop",
-        "/org/freedesktop/portal/desktop",
-        "org.freedesktop.portal.Settings",
-        "ReadOne",
-        c.g_variant_new("(ss)", "org.freedesktop.appearance", "color-scheme"),
-        c.G_VARIANT_TYPE("(v)"),
-        c.G_DBUS_CALL_FLAGS_NONE,
-        -1,
-        null,
-        dbusColorSchemeCallback,
-        self,
-    );
 }
 
 // This timeout function is started when no surfaces are open. It can be
@@ -1563,101 +1541,15 @@ fn gtkWindowIsActive(
     core_app.focusEvent(false);
 }
 
-fn dbusColorSchemeCallback(
-    source_object: [*c]c.GObject,
-    res: ?*c.GAsyncResult,
-    ud: ?*anyopaque,
+fn adwNotifyDark(
+    style_manager: *adw.StyleManager,
+    _: *gobject.ParamSpec,
+    self: *App,
 ) callconv(.C) void {
-    const self: *App = @ptrCast(@alignCast(ud.?));
-    const dbus: *c.GDBusConnection = @ptrCast(source_object);
-
-    var err: ?*c.GError = null;
-    defer if (err) |e| c.g_error_free(e);
-
-    if (c.g_dbus_connection_call_finish(dbus, res, &err)) |value| {
-        if (c.g_variant_is_of_type(value, c.G_VARIANT_TYPE("(v)")) == 1) {
-            var inner: ?*c.GVariant = null;
-            c.g_variant_get(value, "(v)", &inner);
-            defer c.g_variant_unref(inner);
-            if (c.g_variant_is_of_type(inner, c.G_VARIANT_TYPE("u")) == 1) {
-                self.colorSchemeEvent(if (c.g_variant_get_uint32(inner) == 1)
-                    .dark
-                else
-                    .light);
-                return;
-            }
-        }
-    } else if (err) |e| {
-        // If ReadOne is not yet implemented, fall back to deprecated "Read" method
-        // Error code: GDBus.Error:org.freedesktop.DBus.Error.UnknownMethod: No such method “ReadOne”
-        if (self.dbus_color_scheme_retry and e.code == 19) {
-            self.dbus_color_scheme_retry = false;
-            c.g_dbus_connection_call(
-                dbus,
-                "org.freedesktop.portal.Desktop",
-                "/org/freedesktop/portal/desktop",
-                "org.freedesktop.portal.Settings",
-                "Read",
-                c.g_variant_new("(ss)", "org.freedesktop.appearance", "color-scheme"),
-                c.G_VARIANT_TYPE("(v)"),
-                c.G_DBUS_CALL_FLAGS_NONE,
-                -1,
-                null,
-                dbusColorSchemeCallback,
-                self,
-            );
-            return;
-        }
-
-        // Otherwise, log the error and return .light
-        log.warn("unable to get current color scheme: {s}", .{e.message});
-    }
-
-    // Fall back
-    self.colorSchemeEvent(.light);
-}
-
-/// This will be called by D-Bus when the style changes between light & dark.
-fn gtkNotifyColorScheme(
-    _: ?*c.GDBusConnection,
-    _: [*c]const u8,
-    _: [*c]const u8,
-    _: [*c]const u8,
-    _: [*c]const u8,
-    parameters: ?*c.GVariant,
-    user_data: ?*anyopaque,
-) callconv(.C) void {
-    const self: *App = @ptrCast(@alignCast(user_data orelse {
-        log.err("style change notification: userdata is null", .{});
-        return;
-    }));
-
-    if (c.g_variant_is_of_type(parameters, c.G_VARIANT_TYPE("(ssv)")) != 1) {
-        log.err("unexpected parameter type: {s}", .{c.g_variant_get_type_string(parameters)});
-        return;
-    }
-
-    var namespace: [*c]u8 = undefined;
-    var setting: [*c]u8 = undefined;
-    var value: *c.GVariant = undefined;
-    c.g_variant_get(parameters, "(ssv)", &namespace, &setting, &value);
-    defer c.g_free(namespace);
-    defer c.g_free(setting);
-    defer c.g_variant_unref(value);
-
-    // ignore any setting changes that we aren't interested in
-    if (!std.mem.eql(u8, "org.freedesktop.appearance", std.mem.span(namespace))) return;
-    if (!std.mem.eql(u8, "color-scheme", std.mem.span(setting))) return;
-
-    if (c.g_variant_is_of_type(value, c.G_VARIANT_TYPE("u")) != 1) {
-        log.err("unexpected value type: {s}", .{c.g_variant_get_type_string(value)});
-        return;
-    }
-
-    const color_scheme: apprt.ColorScheme = if (c.g_variant_get_uint32(value) == 1)
-        .dark
+    const color_scheme: apprt.ColorScheme = if (style_manager.getDark() == 0)
+        .light
     else
-        .light;
+        .dark;
 
     self.colorSchemeEvent(color_scheme);
 }
