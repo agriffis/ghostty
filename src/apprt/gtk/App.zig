@@ -39,6 +39,7 @@ const ConfigErrorsWindow = @import("ConfigErrorsWindow.zig");
 const ClipboardConfirmationWindow = @import("ClipboardConfirmationWindow.zig");
 const Split = @import("Split.zig");
 const c = @import("c.zig").c;
+const i18n = @import("i18n.zig");
 const version = @import("version.zig");
 const inspector = @import("inspector.zig");
 const key = @import("key.zig");
@@ -97,6 +98,11 @@ quit_timer: union(enum) {
 
 pub fn init(core_app: *CoreApp, opts: Options) !App {
     _ = opts;
+
+    // This can technically be placed *anywhere* because we don't have any
+    // localized log messages. It just has to be placed before any localized
+    // widgets are drawn.
+    try i18n.init(core_app.alloc);
 
     // Log our GTK version
     log.info("GTK version build={d}.{d}.{d} runtime={d}.{d}.{d}", .{
@@ -502,12 +508,12 @@ pub fn performAction(
         .quit_timer => self.quitTimer(value),
         .prompt_title => try self.promptTitle(target),
         .toggle_quick_terminal => return try self.toggleQuickTerminal(),
+        .secure_input => self.setSecureInput(target, value),
 
         // Unimplemented
         .close_all_windows,
         .toggle_visibility,
         .cell_size,
-        .secure_input,
         .key_sequence,
         .render_inspector,
         .renderer_health,
@@ -1407,6 +1413,15 @@ fn newWindow(self: *App, parent_: ?*CoreSurface) !void {
 
     // Show the new window
     window.present();
+}
+
+fn setSecureInput(_: *App, target: apprt.Target, value: apprt.action.SecureInput) void {
+    switch (target) {
+        .app => {},
+        .surface => |surface| {
+            surface.rt_surface.setSecureInput(value);
+        },
+    }
 }
 
 fn quit(self: *App) void {

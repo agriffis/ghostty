@@ -33,6 +33,7 @@ const TabView = @import("TabView.zig");
 const HeaderBar = @import("headerbar.zig");
 const version = @import("version.zig");
 const winproto = @import("winproto.zig");
+const i18n = @import("i18n.zig");
 
 const log = std.log.scoped(.gtk);
 
@@ -80,6 +81,7 @@ pub const DerivedConfig = struct {
     gtk_toolbar_style: configpkg.Config.GtkToolbarStyle,
 
     quick_terminal_position: configpkg.Config.QuickTerminalPosition,
+    quick_terminal_autohide: bool,
 
     maximize: bool,
     fullscreen: bool,
@@ -97,6 +99,7 @@ pub const DerivedConfig = struct {
             .gtk_toolbar_style = config.@"gtk-toolbar-style",
 
             .quick_terminal_position = config.@"quick-terminal-position",
+            .quick_terminal_autohide = config.@"quick-terminal-autohide",
 
             .maximize = config.maximize,
             .fullscreen = config.fullscreen,
@@ -192,7 +195,7 @@ pub fn init(self: *Window, app: *App) !void {
 
     {
         const btn = c.gtk_menu_button_new();
-        c.gtk_widget_set_tooltip_text(btn, "Main Menu");
+        c.gtk_widget_set_tooltip_text(btn, i18n._("Main Menu"));
         c.gtk_menu_button_set_icon_name(@ptrCast(btn), "open-menu-symbolic");
         c.gtk_menu_button_set_popover(@ptrCast(btn), @ptrCast(@alignCast(self.titlebar_menu.asWidget())));
         _ = c.g_signal_connect_data(
@@ -212,7 +215,7 @@ pub fn init(self: *Window, app: *App) !void {
         const btn = switch (self.config.gtk_tabs_location) {
             .top, .bottom => btn: {
                 const btn = c.gtk_toggle_button_new();
-                c.gtk_widget_set_tooltip_text(btn, "View Open Tabs");
+                c.gtk_widget_set_tooltip_text(btn, i18n._("View Open Tabs"));
                 c.gtk_button_set_icon_name(@ptrCast(btn), "view-grid-symbolic");
                 _ = c.g_object_bind_property(
                     btn,
@@ -239,13 +242,14 @@ pub fn init(self: *Window, app: *App) !void {
 
     {
         const btn = c.gtk_button_new_from_icon_name("tab-new-symbolic");
-        c.gtk_widget_set_tooltip_text(btn, "New Tab");
+        c.gtk_widget_set_tooltip_text(btn, i18n._("New Tab"));
         _ = c.g_signal_connect_data(btn, "clicked", c.G_CALLBACK(&gtkTabNewClick), self, null, c.G_CONNECT_DEFAULT);
         self.headerbar.packStart(btn);
     }
 
     _ = c.g_signal_connect_data(self.window, "notify::maximized", c.G_CALLBACK(&gtkWindowNotifyMaximized), self, null, c.G_CONNECT_DEFAULT);
     _ = c.g_signal_connect_data(self.window, "notify::fullscreened", c.G_CALLBACK(&gtkWindowNotifyFullscreened), self, null, c.G_CONNECT_DEFAULT);
+    _ = c.g_signal_connect_data(self.window, "notify::is-active", c.G_CALLBACK(&gtkWindowNotifyIsActive), self, null, c.G_CONNECT_DEFAULT);
 
     // If Adwaita is enabled and is older than 1.4.0 we don't have the tab overview and so we
     // need to stick the headerbar into the content box.
@@ -257,7 +261,7 @@ pub fn init(self: *Window, app: *App) !void {
     // This is a really common issue where people build from source in debug and performance is really bad.
     if (comptime std.debug.runtime_safety) {
         const warning_box = c.gtk_box_new(c.GTK_ORIENTATION_VERTICAL, 0);
-        const warning_text = "⚠️ You're running a debug build of Ghostty! Performance will be degraded.";
+        const warning_text = i18n._("⚠️ You're running a debug build of Ghostty! Performance will be degraded.");
         if (adwaita.versionAtLeast(1, 3, 0)) {
             const banner = c.adw_banner_new(warning_text);
             c.adw_banner_set_revealed(@ptrCast(banner), 1);
@@ -377,7 +381,12 @@ pub fn present(self: *Window) void {
 
 pub fn toggleVisibility(self: *Window) void {
     const window: *gtk.Widget = @ptrCast(self.window);
+
     window.setVisible(@intFromBool(window.isVisible() == 0));
+}
+
+pub fn isQuickTerminal(self: *Window) bool {
+    return self.app.quick_terminal == self;
 }
 
 pub fn updateConfig(
@@ -420,7 +429,7 @@ pub fn syncAppearance(self: *Window) !void {
         if (!csd_enabled) break :visible false;
 
         // Never display the header bar as a quick terminal.
-        if (self.app.quick_terminal == self) break :visible false;
+        if (self.isQuickTerminal()) break :visible false;
 
         // Unconditionally disable the header bar when fullscreened.
         if (self.config.fullscreen) break :visible false;
@@ -471,12 +480,6 @@ pub fn syncAppearance(self: *Window) !void {
     self.winproto.syncAppearance() catch |err| {
         log.warn("failed to sync winproto appearance error={}", .{err});
     };
-
-    if (self.app.quick_terminal == self) {
-        self.winproto.syncQuickTerminal() catch |err| {
-            log.warn("failed to sync quick terminal appearance error={}", .{err});
-        };
-    }
 }
 
 fn toggleCssClass(
@@ -674,10 +677,10 @@ pub fn focusCurrentTab(self: *Window) void {
 }
 
 pub fn onConfigReloaded(self: *Window) void {
-    self.sendToast("Reloaded the configuration");
+    self.sendToast(i18n._("Reloaded the configuration"));
 }
 
-pub fn sendToast(self: *Window, title: [:0]const u8) void {
+pub fn sendToast(self: *Window, title: [*:0]const u8) void {
     const toast = c.adw_toast_new(title);
     c.adw_toast_set_timeout(toast, 3);
     c.adw_toast_overlay_add_toast(@ptrCast(self.toast_overlay), toast);
@@ -727,6 +730,20 @@ fn gtkWindowNotifyFullscreened(
     self.syncAppearance() catch |err| {
         log.err("failed to sync appearance={}", .{err});
     };
+}
+
+fn gtkWindowNotifyIsActive(
+    _: *c.GObject,
+    _: *c.GParamSpec,
+    ud: ?*anyopaque,
+) callconv(.C) void {
+    const self = userdataSelf(ud orelse return);
+    if (!self.isQuickTerminal()) return;
+
+    // Hide when we're unfocused
+    if (self.config.quick_terminal_autohide and c.gtk_window_is_active(self.window) == 0) {
+        self.toggleVisibility();
+    }
 }
 
 // Note: we MUST NOT use the GtkButton parameter because gtkActionNewTab
@@ -802,7 +819,7 @@ pub fn close(self: *Window) void {
     const window: *gtk.Window = @ptrCast(self.window);
 
     // Unset the quick terminal on the app level
-    if (self.app.quick_terminal == self) self.app.quick_terminal = null;
+    if (self.isQuickTerminal()) self.app.quick_terminal = null;
 
     window.destroy();
 }
@@ -811,9 +828,6 @@ fn gtkCloseRequest(v: *c.GtkWindow, ud: ?*anyopaque) callconv(.C) bool {
     _ = v;
     log.debug("window close request", .{});
     const self = userdataSelf(ud.?);
-
-    // This path should never occur, but this is here as a safety measure.
-    if (self.app.quick_terminal == self) return true;
 
     // If none of our surfaces need confirmation, we can just exit.
     for (self.app.core_app.surfaces.items) |surface| {
@@ -930,7 +944,7 @@ fn gtkActionAbout(
             "application-name",
             name,
             "developer-name",
-            "Ghostty Developers",
+            i18n._("Ghostty Developers"),
             "application-icon",
             icon,
             "version",
@@ -949,7 +963,7 @@ fn gtkActionAbout(
             "logo-icon-name",
             icon,
             "title",
-            "About Ghostty",
+            i18n._("About Ghostty"),
             "version",
             build_config.version_string.ptr,
             "website",
