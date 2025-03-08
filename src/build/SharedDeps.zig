@@ -381,6 +381,17 @@ pub fn add(
         if (self.config.renderer == .opengl) {
             step.linkFramework("OpenGL");
         }
+
+        // Apple platforms do not include libc libintl so we bundle it.
+        // This is LGPL but since our source code is open source we are
+        // in compliance with the LGPL since end users can modify this
+        // build script to replace the bundled libintl with their own.
+        const libintl_dep = b.dependency("libintl", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        step.linkLibrary(libintl_dep.artifact("intl"));
+        try static_libs.append(libintl_dep.artifact("intl").getEmittedBin());
     }
 
     // cimgui
@@ -484,7 +495,24 @@ pub fn add(
                     step.root_module.addImport("wayland", wayland);
                     step.root_module.addImport("gdk_wayland", gobject.module("gdkwayland4"));
 
-                    if (self.config.layer_shell) step.linkSystemLibrary2("gtk4-layer-shell", dynamic_link_opts);
+                    const gtk4_layer_shell = b.dependency("gtk4_layer_shell", .{
+                        .target = target,
+                        .optimize = optimize,
+                    });
+                    const layer_shell_module = gtk4_layer_shell.module("gtk4-layer-shell");
+                    layer_shell_module.addImport("gtk", gobject.module("gtk4"));
+                    step.root_module.addImport("gtk4-layer-shell", layer_shell_module);
+
+                    // IMPORTANT: gtk4-layer-shell must be linked BEFORE
+                    // wayland-client, as it relies on shimming libwayland's APIs.
+                    if (b.systemIntegrationOption("gtk4-layer-shell", .{})) {
+                        step.linkSystemLibrary2("gtk4-layer-shell", dynamic_link_opts);
+                    } else {
+                        // gtk4-layer-shell *must* be dynamically linked,
+                        // so we don't add it as a static library
+                        step.linkLibrary(gtk4_layer_shell.artifact("gtk4-layer-shell"));
+                    }
+
                     step.linkSystemLibrary2("wayland-client", dynamic_link_opts);
                 }
 

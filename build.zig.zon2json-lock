@@ -139,6 +139,11 @@
     "url": "https://github.com/GNOME/libxml2/archive/refs/tags/v2.11.5.tar.gz",
     "hash": "sha256-bCgFni4+60K1tLFkieORamNGwQladP7jvGXNxdiaYhU="
   },
+  "12203eff4829ad8afdd828eb323d48e5ba8dbb44d224e9e314d4ab1533c2bec20f4b": {
+    "name": "gtk4_layer_shell",
+    "url": "https://github.com/wmww/gtk4-layer-shell/archive/refs/tags/v1.1.0.tar.gz",
+    "hash": "sha256-mChCgSYKXu9bT2OlXxbEv2p4ihAgptsDfssPcfozaYg="
+  },
   "1220b8588f106c996af10249bfa092c6fb2f35fbacb1505ef477a0b04a7dd1063122": {
     "name": "harfbuzz",
     "url": "https://deps.files.ghostty.org/harfbuzz-1220b8588f106c996af10249bfa092c6fb2f35fbacb1505ef477a0b04a7dd1063122.tar.gz",
@@ -148,6 +153,11 @@
     "name": "highway",
     "url": "https://deps.files.ghostty.org/highway-12205c83b8311a24b1d5ae6d21640df04f4b0726e314337c043cde1432758cbe165b.tar.gz",
     "hash": "sha256-NUqLRTm1iOcLmOxwhEJz4/J0EwLEw3e8xOgbPRhm98k="
+  },
+  "1220f870c853529233ea64a108acaaa81f8d06d7ff4b66c76930be7d78d508aff7a2": {
+    "name": "gettext",
+    "url": "https://deps.files.ghostty.org/gettext-0.24.tar.gz",
+    "hash": "sha256-yRhQPVk9cNr0hE0XWhPYFq+stmfAb7oeydzVACwVGLc="
   },
   "1220c15e72eadd0d9085a8af134904d9a0f5dfcbed5f606ad60edc60ebeccd9706bb": {
     "name": "oniguruma",
