@@ -56,7 +56,7 @@ zig build \
     -Dcpu=baseline \
     -Dpie=true \
     -Demit-docs \
-    -fsys=gtk4-layer-shell
+    --system
 
 # Find the files because manually listing them is boring.
 find "%{buildroot}" -type f | \
