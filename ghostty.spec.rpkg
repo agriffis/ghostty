@@ -13,15 +13,18 @@ BuildRequires: blueprint-compiler
 BuildRequires: fontconfig-devel
 BuildRequires: freetype-devel
 BuildRequires: glib2-devel
+BuildRequires: glslang-devel
 BuildRequires: gtk4-devel
 BuildRequires: gtk4-layer-shell-devel
 BuildRequires: harfbuzz-devel
 BuildRequires: libadwaita-devel
 BuildRequires: libpng-devel
+BuildRequires: libxml2-devel
 BuildRequires: oniguruma-devel
 BuildRequires: pandoc-cli
 BuildRequires: pixman-devel
 BuildRequires: pkg-config
+BuildRequires: simdutf-devel
 BuildRequires: wayland-protocols-devel
 BuildRequires: zig
 BuildRequires: zlib-ng-devel
@@ -45,18 +48,24 @@ platform-native UI and GPU acceleration.
 {{{git_setup_macro path="$GIT_ROOT"}}}
 
 %build
+# Download deps to enable system integrations.
+# https://github.com/ghostty-org/ghostty/issues/6632#issuecomment-2722745586
+export ZIG_GLOBAL_CACHE_DIR="$PWD/.zig-offline-cache"
+./nix/build-support/fetch-zig-cache.sh
+
 # Replace the caret in the rpm version with something that doesn't break Zig.
 v="%{version}-%{release}"
 v="${v/^/+}"
+DESTDIR="%{buildroot}" \
 zig build \
     --summary all \
-    --prefix "%{buildroot}%{_prefix}" \
+    --prefix "%{_prefix}" \
+    --system "$ZIG_GLOBAL_CACHE_DIR/p" \
     -Dversion-string="$v" \
     -Doptimize=ReleaseFast \
     -Dcpu=baseline \
     -Dpie=true \
-    -Demit-docs \
-    -fsys=gtk4-layer-shell
+    -Demit-docs
 
 # Find the files because manually listing them is boring.
 find "%{buildroot}" -type f | \
