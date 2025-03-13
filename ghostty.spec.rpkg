@@ -55,7 +55,8 @@ zig build \
     -Doptimize=ReleaseFast \
     -Dcpu=baseline \
     -Dpie=true \
-    -Demit-docs
+    -Demit-docs \
+    -fsys=gtk4-layer-shell
 
 # Find the files because manually listing them is boring.
 find "%{buildroot}" -type f | \
