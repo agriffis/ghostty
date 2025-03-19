@@ -37,7 +37,7 @@ const CloseDialog = @import("CloseDialog.zig");
 const inspectorpkg = @import("inspector.zig");
 const gtk_key = @import("key.zig");
 const Builder = @import("Builder.zig");
-const adwaita = @import("adwaita.zig");
+const adw_version = @import("adw_version.zig");
 
 const log = std.log.scoped(.gtk_surface);
 
@@ -370,6 +370,7 @@ pub fn init(self: *Surface, app: *App, opts: Options) !void {
 
     // Create an overlay so we can layer the GL area with other widgets.
     const overlay = gtk.Overlay.new();
+    errdefer overlay.unref();
     const overlay_widget = overlay.as(gtk.Widget);
     overlay.setChild(gl_area_widget);
 
@@ -1057,7 +1058,7 @@ fn resolveTitle(self: *Surface, title: [:0]const u8) [:0]const u8 {
 }
 
 pub fn promptTitle(self: *Surface) !void {
-    if (!adwaita.versionAtLeast(1, 5, 0)) return;
+    if (!adw_version.atLeast(1, 5, 0)) return;
     const window = self.container.window() orelse return;
 
     var builder = Builder.init("prompt-title-dialog", 1, 5, .blp);
@@ -1341,8 +1342,7 @@ pub fn showDesktopNotification(
     const pointer = glib.Variant.newUint64(@intFromPtr(&self.core_surface));
     notification.setDefaultActionAndTargetValue("app.present-surface", pointer);
 
-    // FIXME: when App.zig gets converted to zig-gobject
-    const app: gio.Application = @ptrCast(@alignCast(self.app.app));
+    const app = self.app.app.as(gio.Application);
 
     // We set the notification ID to the body content. If the content is the
     // same, this notification may replace a previous notification
@@ -2381,7 +2381,7 @@ fn g_value_holds(value_: ?*gobject.Value, g_type: gobject.Type) bool {
 }
 
 fn gtkPromptTitleResponse(source_object: ?*gobject.Object, result: *gio.AsyncResult, ud: ?*anyopaque) callconv(.C) void {
-    if (!adwaita.versionAtLeast(1, 5, 0)) return;
+    if (!adw_version.supportsDialogs()) return;
     const dialog = gobject.ext.cast(adw.AlertDialog, source_object.?).?;
     const self = userdataSelf(ud orelse return);
 

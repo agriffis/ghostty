@@ -16,7 +16,6 @@ const CoreSurface = @import("../../Surface.zig");
 
 const Surface = @import("Surface.zig");
 const Window = @import("Window.zig");
-const adwaita = @import("adwaita.zig");
 const CloseDialog = @import("CloseDialog.zig");
 
 const log = std.log.scoped(.gtk);
@@ -64,6 +63,7 @@ pub fn init(self: *Tab, window: *Window, parent_: ?*CoreSurface) !void {
     // box makes it easier to maintain the tab contents because we never need to
     // change the root widget of the notebook page (tab).
     const box = gtk.Box.new(.vertical, 0);
+    errdefer box.unref();
     const box_widget = box.as(gtk.Widget);
     box_widget.setHexpand(1);
     box_widget.setVexpand(1);
