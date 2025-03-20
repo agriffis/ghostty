@@ -239,7 +239,17 @@ jobs:
           authToken: "${{ secrets.CACHIX_AUTH_TOKEN }}"
 
       - name: Build and Check Source Tarball
-        run: nix develop -c zig build distcheck
+        run: |
+          rm -rf zig-out/dist
+          nix develop -c zig build distcheck
+          cp zig-out/dist/*.tar.gz ghostty-source.tar.gz
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: source-tarball
+          path: |-
+            ghostty-source.tar.gz
 
   build-macos:
     runs-on: namespace-profile-ghostty-macos
@@ -828,21 +838,28 @@ jobs:
   test-debian-12:
     name: Test build on Debian 12
     runs-on: namespace-profile-ghostty-sm
-    needs: test
+    needs: [test, build-dist]
     steps:
-      - name: Checkout code
-        uses: actions/checkout@v4
-
       - name: Install and configure Namespace CLI
         uses: namespacelabs/nscloud-setup@v0
 
       - name: Configure Namespace powered Buildx
         uses: namespacelabs/nscloud-setup-buildx-action@v0
 
+      - name: Download Source Tarball Artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: source-tarball
+
+      - name: Extract tarball
+        run: |
+          mkdir dist
+          tar --verbose --extract --strip-components 1 --directory dist --file ghostty-source.tar.gz
+
       - name: Build and push
         uses: docker/build-push-action@v6
         with:
-          context: .
-          file: src/build/docker/debian/Dockerfile
+          context: dist
+          file: dist/src/build/docker/debian/Dockerfile
           build-args: |
             DISTRO_VERSION=12
