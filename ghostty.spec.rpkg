@@ -72,6 +72,11 @@ find "%{buildroot}" -type f | \
 sed 's,^%{buildroot},,' | \
 grep -v '^%{_datadir}/ghostty/' > files
 
+# Resolve Fedora 42 ncurses-term conflict.
+%if 0%{?fedora} >= 42
+sed -ie '\,^/usr/share/terminfo/g/ghostty$,d' files
+%endif
+
 %files -f files
 %license LICENSE
 %{_datadir}/ghostty
