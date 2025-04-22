@@ -398,7 +398,7 @@ class AppDelegate: NSObject,
         syncMenuShortcut(config, action: "increase_font_size:1", menuItem: self.menuIncreaseFontSize)
         syncMenuShortcut(config, action: "decrease_font_size:1", menuItem: self.menuDecreaseFontSize)
         syncMenuShortcut(config, action: "reset_font_size", menuItem: self.menuResetFontSize)
-        syncMenuShortcut(config, action: "change_title_prompt", menuItem: self.menuChangeTitle)
+        syncMenuShortcut(config, action: "prompt_surface_title", menuItem: self.menuChangeTitle)
         syncMenuShortcut(config, action: "toggle_quick_terminal", menuItem: self.menuQuickTerminal)
         syncMenuShortcut(config, action: "toggle_visibility", menuItem: self.menuToggleVisibility)
         syncMenuShortcut(config, action: "inspector:toggle", menuItem: self.menuTerminalInspector)
@@ -419,15 +419,15 @@ class AppDelegate: NSObject,
     /// action string used for the Ghostty configuration.
     private func syncMenuShortcut(_ config: Ghostty.Config, action: String, menuItem: NSMenuItem?) {
         guard let menu = menuItem else { return }
-        guard let equiv = config.keyEquivalent(for: action) else {
+        guard let shortcut = config.keyboardShortcut(for: action) else {
             // No shortcut, clear the menu item
             menu.keyEquivalent = ""
             menu.keyEquivalentModifierMask = []
             return
         }
 
-        menu.keyEquivalent = equiv.key
-        menu.keyEquivalentModifierMask = equiv.modifiers
+        menu.keyEquivalent = shortcut.key.character.description
+        menu.keyEquivalentModifierMask = .init(swiftUIFlags: shortcut.modifiers)
     }
 
     private func focusedSurface() -> ghostty_surface_t? {
