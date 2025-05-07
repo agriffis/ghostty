@@ -279,6 +279,7 @@ pub const Action = union(enum) {
     /// Scroll the screen varying amounts.
     scroll_to_top,
     scroll_to_bottom,
+    scroll_to_selection,
     scroll_page_up,
     scroll_page_down,
     scroll_page_fractional: f32,
@@ -345,7 +346,7 @@ pub const Action = union(enum) {
     move_tab: isize,
 
     /// Toggle the tab overview.
-    /// This only works with libadwaita enabled currently.
+    /// This only works with libadwaita version 1.4.0 or newer.
     toggle_tab_overview,
 
     /// Change the title of the current focused surface via a prompt.
@@ -789,6 +790,7 @@ pub const Action = union(enum) {
             .select_all,
             .scroll_to_top,
             .scroll_to_bottom,
+            .scroll_to_selection,
             .scroll_page_up,
             .scroll_page_down,
             .scroll_page_fractional,
