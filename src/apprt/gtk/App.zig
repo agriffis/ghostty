@@ -74,6 +74,9 @@ cursor_none: ?*gdk.Cursor,
 /// The clipboard confirmation window, if it is currently open.
 clipboard_confirmation_window: ?*ClipboardConfirmationWindow = null,
 
+/// The config errors dialog, if it is currently open.
+config_errors_dialog: ?ConfigErrorsDialog = null,
+
 /// The window containing the quick terminal.
 /// Null when never initialized.
 quick_terminal: ?*Window = null,
@@ -1527,7 +1530,7 @@ fn adwNotifyDark(
     style_manager: *adw.StyleManager,
     _: *gobject.ParamSpec,
     self: *App,
-) callconv(.C) void {
+) callconv(.c) void {
     const color_scheme: apprt.ColorScheme = if (style_manager.getDark() == 0)
         .light
     else
