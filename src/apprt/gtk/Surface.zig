@@ -1191,7 +1191,7 @@ pub fn mouseOverLink(self: *Surface, uri_: ?[]const u8) void {
         return;
     }
 
-    self.url_widget = URLWidget.init(self.overlay, uriZ);
+    self.url_widget = .init(self.overlay, uriZ);
 }
 
 pub fn supportsClipboard(
@@ -1563,7 +1563,7 @@ fn gtkMouseMotion(
     const scaled = self.scaledCoordinates(x, y);
 
     const pos: apprt.CursorPos = .{
-        .x = @floatCast(@max(0, scaled.x)),
+        .x = @floatCast(scaled.x),
         .y = @floatCast(scaled.y),
     };
 
