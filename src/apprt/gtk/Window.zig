@@ -90,6 +90,7 @@ pub const DerivedConfig = struct {
     quick_terminal_position: configpkg.Config.QuickTerminalPosition,
     quick_terminal_size: configpkg.Config.QuickTerminalSize,
     quick_terminal_autohide: bool,
+    quick_terminal_keyboard_interactivity: configpkg.Config.QuickTerminalKeyboardInteractivity,
 
     maximize: bool,
     fullscreen: bool,
@@ -109,6 +110,7 @@ pub const DerivedConfig = struct {
             .quick_terminal_position = config.@"quick-terminal-position",
             .quick_terminal_size = config.@"quick-terminal-size",
             .quick_terminal_autohide = config.@"quick-terminal-autohide",
+            .quick_terminal_keyboard_interactivity = config.@"quick-terminal-keyboard-interactivity",
 
             .maximize = config.maximize,
             .fullscreen = config.fullscreen,
@@ -814,11 +816,15 @@ fn gtkWindowNotifyIsActive(
     _: *gobject.ParamSpec,
     self: *Window,
 ) callconv(.c) void {
-    if (!self.isQuickTerminal()) return;
+    self.winproto.setUrgent(false) catch |err| {
+        log.err("failed to unrequest user attention={}", .{err});
+    };
 
-    // Hide when we're unfocused
-    if (self.config.quick_terminal_autohide and self.window.as(gtk.Window).isActive() == 0) {
-        self.toggleVisibility();
+    if (self.isQuickTerminal()) {
+        // Hide when we're unfocused
+        if (self.config.quick_terminal_autohide and self.window.as(gtk.Window).isActive() == 0) {
+            self.toggleVisibility();
+        }
     }
 }
 
