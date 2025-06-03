@@ -67,15 +67,15 @@ zig build \
     -Dpie=true \
     -Demit-docs
 
+# Resolve Fedora 42 ncurses-term conflict.
+%if 0%{?fedora} >= 42
+rm -rf "%{buildroot}%{_datadir}/terminfo"
+%endif
+
 # Find the files because manually listing them is boring.
 find "%{buildroot}" -type f | \
 sed 's,^%{buildroot},,' | \
 grep -v '^%{_datadir}/ghostty/' > files
-
-# Resolve Fedora 42 ncurses-term conflict.
-%if 0%{?fedora} >= 42
-sed -ie '\,^/usr/share/terminfo/g/ghostty$,d' files
-%endif
 
 %files -f files
 %license LICENSE
