@@ -45,6 +45,17 @@ class TerminalWindow: NSWindow {
         },
     ]
 
+    // false if all three traffic lights are missing/hidden, otherwise true
+    private var hasWindowButtons: Bool {
+        get {
+            // if standardWindowButton(.theButton) == nil, the button isn't there, so coalesce to true
+            let closeIsHidden = standardWindowButton(.closeButton)?.isHiddenOrHasHiddenAncestor ?? true
+            let miniaturizeIsHidden = standardWindowButton(.miniaturizeButton)?.isHiddenOrHasHiddenAncestor ?? true
+            let zoomIsHidden = standardWindowButton(.zoomButton)?.isHiddenOrHasHiddenAncestor ?? true
+            return !(closeIsHidden && miniaturizeIsHidden && zoomIsHidden)
+        }
+    }
+
     // Both of these must be true for windows without decorations to be able to
     // still become key/main and receive events.
     override var canBecomeKey: Bool { return true }
@@ -66,7 +77,7 @@ class TerminalWindow: NSWindow {
 		if titlebarTabs {
 			generateToolbar()
 		}
-        
+
         level = UserDefaults.standard.value(forKey: Self.defaultLevelKey) as? NSWindow.Level ?? .normal
     }
 
@@ -375,6 +386,7 @@ class TerminalWindow: NSWindow {
         if !titlebarAccessoryViewControllers.contains(resetZoomTitlebarAccessoryViewController) {
             addTitlebarAccessoryViewController(resetZoomTitlebarAccessoryViewController)
         }
+
         resetZoomTitlebarAccessoryViewController.view.isHidden = tabGroup.isTabBarVisible ? true : !surfaceIsZoomed
     }
 
@@ -613,7 +625,7 @@ class TerminalWindow: NSWindow {
 
         view.translatesAutoresizingMaskIntoConstraints = false
         view.leftAnchor.constraint(equalTo: toolbarView.leftAnchor).isActive = true
-        view.rightAnchor.constraint(equalTo: toolbarView.leftAnchor, constant: 78).isActive = true
+        view.rightAnchor.constraint(equalTo: toolbarView.leftAnchor, constant: hasWindowButtons ? 78 : 0).isActive = true
         view.topAnchor.constraint(equalTo: toolbarView.topAnchor).isActive = true
         view.heightAnchor.constraint(equalTo: toolbarView.heightAnchor).isActive = true
 
