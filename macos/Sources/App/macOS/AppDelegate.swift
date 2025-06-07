@@ -316,6 +316,13 @@ class AppDelegate: NSObject,
         }
     }
 
+    func applicationWillTerminate(_ notification: Notification) {
+        // We have no notifications we want to persist after death,
+        // so remove them all now. In the future we may want to be
+        // more selective and only remove surface-targeted notifications.
+        UNUserNotificationCenter.current().removeAllDeliveredNotifications()
+    }
+
     /// This is called when the application is already open and someone double-clicks the icon
     /// or clicks the dock icon.
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
@@ -530,11 +537,13 @@ class AppDelegate: NSObject,
     }
 
     @objc private func ghosttyBellDidRing(_ notification: Notification) {
-        // Bounce the dock icon if we're not focused.
-        NSApp.requestUserAttention(.informationalRequest)
+        if (ghostty.config.bellFeatures.contains(.attention)) {
+            // Bounce the dock icon if we're not focused.
+            NSApp.requestUserAttention(.informationalRequest)
 
-        // Handle setting the dock badge based on permissions
-        ghosttyUpdateBadgeForBell()
+            // Handle setting the dock badge based on permissions
+            ghosttyUpdateBadgeForBell()
+        }
     }
 
     private func ghosttyUpdateBadgeForBell() {
