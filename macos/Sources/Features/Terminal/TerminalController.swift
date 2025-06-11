@@ -278,11 +278,6 @@ class TerminalController: BaseTerminalController {
             tg.removeWindow(window)
         }
 
-        // Our windows start out invisible. We need to make it visible. If we
-        // don't do this then various features such as window blur won't work because
-        // the macOS APIs only work on a visible window.
-        controller.showWindow(self)
-
         // If we have the "hidden" titlebar style we want to create new
         // tabs as windows instead, so just skip adding it to the parent.
         if (ghostty.config.macosTitlebarStyle != "hidden") {
@@ -303,7 +298,19 @@ class TerminalController: BaseTerminalController {
             }
         }
 
-        window.makeKeyAndOrderFront(self)
+        // We're dispatching this async because otherwise the lastCascadePoint doesn't
+        // take effect. Our best theory is there is some next-event-loop-tick logic
+        // that Cocoa is doing that we need to be after.
+        DispatchQueue.main.async {
+            // Only cascade if we aren't fullscreen and are alone in the tab group.
+            if !window.styleMask.contains(.fullScreen) &&
+                window.tabGroup?.windows.count ?? 1 == 1 {
+                Self.lastCascadePoint = window.cascadeTopLeft(from: Self.lastCascadePoint)
+            }
+
+            controller.showWindow(self)
+            window.makeKeyAndOrderFront(self)
+        }
 
         // It takes an event loop cycle until the macOS tabGroup state becomes
         // consistent which causes our tab labeling to be off when the "+" button
@@ -1046,7 +1053,12 @@ class TerminalController: BaseTerminalController {
     //MARK: - NSWindowDelegate
 
     override func windowShouldClose(_ sender: NSWindow) -> Bool {
-        closeWindow(sender)
+        // If we have tabs, then this should only close the tab.
+        if window?.tabGroup?.windows.count ?? 0 > 1 {
+            closeTab(sender)
+        } else {
+            closeWindow(sender)
+        }
 
         // We will always explicitly close the window using the above
         return false
