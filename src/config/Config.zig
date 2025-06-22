@@ -266,6 +266,9 @@ pub const renamed = std.StaticStringMap([]const u8).initComptime(&.{
 /// This affects the appearance of text and of any images with transparency.
 /// Additionally, custom shaders will receive colors in the configured space.
 ///
+/// On macOS the default is `native`, on all other platforms the default is
+/// `linear-corrected`.
+///
 /// Valid values:
 ///
 /// * `native` - Perform alpha blending in the native color space for the OS.
@@ -276,12 +279,15 @@ pub const renamed = std.StaticStringMap([]const u8).initComptime(&.{
 ///   when certain color combinations are used (e.g. red / green), but makes
 ///   dark text look much thinner than normal and light text much thicker.
 ///   This is also sometimes known as "gamma correction".
-///   (Currently only supported on macOS. Has no effect on Linux.)
 ///
 /// * `linear-corrected` - Same as `linear`, but with a correction step applied
 ///   for text that makes it look nearly or completely identical to `native`,
 ///   but without any of the darkening artifacts.
-@"alpha-blending": AlphaBlending = .native,
+@"alpha-blending": AlphaBlending =
+    if (builtin.os.tag == .macos)
+        .native
+    else
+        .@"linear-corrected",
 
 /// All of the configurations behavior adjust various metrics determined by the
 /// font. The values can be integers (1, -1, etc.) or a percentage (20%, -15%,
@@ -1823,7 +1829,7 @@ keybind: Keybinds = .{},
 /// Automatically hide the quick terminal when focus shifts to another window.
 /// Set it to false for the quick terminal to remain open even when it loses focus.
 ///
-/// Defaults to true on macOS and on false on Linux. This is because global
+/// Defaults to true on macOS and on false on Linux/BSD. This is because global
 /// shortcuts on Linux require system configuration and are considerably less
 /// accessible than on macOS, meaning that it is more preferable to keep the
 /// quick terminal open until the user has completed their task.
@@ -1961,9 +1967,6 @@ keybind: Keybinds = .{},
 /// causing the window to be completely black. If this happens, you can
 /// unset this configuration to disable the shader.
 ///
-/// On Linux, this requires OpenGL 4.2. Ghostty typically only requires
-/// OpenGL 3.3, but custom shaders push that requirement up to 4.2.
-///
 /// The shader API is identical to the Shadertoy API: you specify a `mainImage`
 /// function and the available uniforms match Shadertoy. The iChannel0 uniform
 /// is a texture containing the rendered terminal screen.
@@ -1977,8 +1980,7 @@ keybind: Keybinds = .{},
 /// This can be repeated multiple times to load multiple shaders. The shaders
 /// will be run in the order they are specified.
 ///
-/// Changing this value at runtime and reloading the configuration will only
-/// affect new windows, tabs, and splits.
+/// This can be changed at runtime and will affect all open terminals.
 @"custom-shader": RepeatablePath = .{},
 
 /// If `true` (default), the focused terminal surface will run an animation
@@ -1996,8 +1998,7 @@ keybind: Keybinds = .{},
 /// will use more CPU per terminal surface and can become quite expensive
 /// depending on the shader and your terminal usage.
 ///
-/// This value can be changed at runtime and will affect all currently
-/// open terminals.
+/// This can be changed at runtime and will affect all open terminals.
 @"custom-shader-animation": CustomShaderAnimation = .true,
 
 /// Bell features to enable if bell support is available in your runtime. Not
@@ -2355,6 +2356,29 @@ keybind: Keybinds = .{},
 ///
 @"macos-icon-screen-color": ?ColorList = null,
 
+/// Whether macOS Shortcuts are allowed to control Ghostty.
+///
+/// Ghostty exposes a number of actions that allow Shortcuts to
+/// control and interact with Ghostty. This includes creating new
+/// terminals, sending text to terminals, running commands, invoking
+/// any keybind action, etc.
+///
+/// This is a powerful feature but can be a security risk if a malicious
+/// shortcut is able to be installed and executed. Therefore, this
+/// configuration allows you to disable this feature.
+///
+/// Valid values are:
+///
+/// * `ask` - Ask the user whether for permission. Ghostty will remember
+///   this choice and never ask again. This is similar to other macOS
+///   permissions such as microphone access, camera access, etc.
+///
+/// * `allow` - Allow Shortcuts to control Ghostty without asking.
+///
+/// * `deny` - Deny Shortcuts from controlling Ghostty.
+///
+@"macos-shortcuts": MacShortcuts = .ask,
+
 /// Put every surface (tab, split, window) into a dedicated Linux cgroup.
 ///
 /// This makes it so that resource management can be done on a per-surface
@@ -2381,7 +2405,10 @@ keybind: Keybinds = .{},
 ///   * `single-instance` - Enable cgroups only for Ghostty instances launched
 ///     as single-instance applications (see gtk-single-instance).
 ///
-@"linux-cgroup": LinuxCgroup = .@"single-instance",
+@"linux-cgroup": LinuxCgroup = if (builtin.os.tag == .linux)
+    .@"single-instance"
+else
+    .never,
 
 /// Memory limit for any individual terminal process (tab, split, window,
 /// etc.) in bytes. If this is unset then no memory limit will be set.
@@ -2794,7 +2821,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
         .windows => {},
 
         // Fast-path if we are Linux and have no args.
-        .linux => if (std.os.argv.len <= 1) return,
+        .linux, .freebsd => if (std.os.argv.len <= 1) return,
 
         // Everything else we have to at least try because it may
         // not use std.os.argv.
@@ -2812,7 +2839,7 @@ pub fn loadCliArgs(self: *Config, alloc_gpa: Allocator) !void {
     //     styling, etc. based on the command.
     //
     // See: https://github.com/Vladimir-csp/xdg-terminal-exec
-    if (comptime builtin.os.tag == .linux) {
+    if ((comptime builtin.os.tag == .linux) or (comptime builtin.os.tag == .freebsd)) {
         if (internal_os.xdg.parseTerminalExec(std.os.argv)) |args| {
             const arena_alloc = self._arena.?.allocator();
 
@@ -3002,6 +3029,11 @@ pub fn loadRecursiveFiles(self: *Config, alloc_gpa: Allocator) !void {
             replay_suffix.items,
         );
     }
+}
+
+/// Get the arena allocator associated with the configuration.
+pub fn arenaAlloc(self: *Config) Allocator {
+    return self._arena.?.allocator();
 }
 
 /// Change the state of conditionals and reload the configuration
@@ -5954,6 +5986,13 @@ pub const MacAppIconFrame = enum {
     beige,
     plastic,
     chrome,
+};
+
+/// See macos-shortcuts
+pub const MacShortcuts = enum {
+    allow,
+    deny,
+    ask,
 };
 
 /// See gtk-single-instance
