@@ -237,6 +237,7 @@ const DerivedConfig = struct {
     /// For docs for these, see the associated config they are derived from.
     original_font_size: f32,
     keybind: configpkg.Keybinds,
+    abnormal_command_exit_runtime_ms: u32,
     clipboard_read: configpkg.ClipboardAccess,
     clipboard_write: configpkg.ClipboardAccess,
     clipboard_trim_trailing_spaces: bool,
@@ -255,6 +256,7 @@ const DerivedConfig = struct {
     macos_option_as_alt: ?configpkg.OptionAsAlt,
     selection_clear_on_typing: bool,
     vt_kam_allowed: bool,
+    wait_after_command: bool,
     window_padding_top: u32,
     window_padding_bottom: u32,
     window_padding_left: u32,
@@ -301,6 +303,7 @@ const DerivedConfig = struct {
         return .{
             .original_font_size = config.@"font-size",
             .keybind = try config.keybind.clone(alloc),
+            .abnormal_command_exit_runtime_ms = config.@"abnormal-command-exit-runtime",
             .clipboard_read = config.@"clipboard-read",
             .clipboard_write = config.@"clipboard-write",
             .clipboard_trim_trailing_spaces = config.@"clipboard-trim-trailing-spaces",
@@ -319,6 +322,7 @@ const DerivedConfig = struct {
             .macos_option_as_alt = config.@"macos-option-as-alt",
             .selection_clear_on_typing = config.@"selection-clear-on-typing",
             .vt_kam_allowed = config.@"vt-kam-allowed",
+            .wait_after_command = config.@"wait-after-command",
             .window_padding_top = config.@"window-padding-y".top_left,
             .window_padding_bottom = config.@"window-padding-y".bottom_right,
             .window_padding_left = config.@"window-padding-x".top_left,
@@ -911,11 +915,7 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
 
         .close => self.close(),
 
-        // Close without confirmation.
-        .child_exited => {
-            self.child_exited = true;
-            self.close();
-        },
+        .child_exited => |v| self.childExited(v),
 
         .desktop_notification => |notification| {
             if (!self.config.desktop_notifications) {
@@ -946,6 +946,136 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
     }
+}
+
+fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
+    // Mark our flag that we exited immediately
+    self.child_exited = true;
+
+    // If our runtime was below some threshold then we assume that this
+    // was an abnormal exit and we show an error message.
+    if (info.runtime_ms <= self.config.abnormal_command_exit_runtime_ms) runtime: {
+        // On macOS, our exit code detection doesn't work, possibly
+        // because of our `login` wrapper. More investigation required.
+        if (comptime builtin.target.os.tag.isDarwin()) break :runtime;
+
+        // If the exit code is 0 then we it was a good exit.
+        if (info.exit_code == 0) break :runtime;
+        log.warn("abnormal process exit detected, showing error message", .{});
+
+        // Update our terminal to note the abnormal exit. In the future we
+        // may want the apprt to handle this to show some native GUI element.
+        self.childExitedAbnormally(info) catch |err| {
+            log.err("error handling abnormal child exit err={}", .{err});
+            return;
+        };
+
+        return;
+    }
+
+    // We output a message so that the user knows whats going on and
+    // doesn't think their terminal just froze. We show this unconditionally
+    // on close even if `wait_after_command` is false and the surface closes
+    // immediately because if a user does an `undo` to restore a closed
+    // surface then they will see this message and know the process has
+    // completed.
+    terminal: {
+        self.renderer_state.mutex.lock();
+        defer self.renderer_state.mutex.unlock();
+        const t: *terminal.Terminal = self.renderer_state.terminal;
+        t.carriageReturn();
+        t.linefeed() catch break :terminal;
+        t.printString("Process exited. Press any key to close the terminal.") catch
+            break :terminal;
+        t.modes.set(.cursor_visible, false);
+    }
+
+    // Waiting after command we stop here. The terminal is updated, our
+    // state is updated, and now its up to the user to decide what to do.
+    if (self.config.wait_after_command) return;
+
+    // If we aren't waiting after the command, then we exit immediately
+    // with no confirmation.
+    self.close();
+}
+
+/// Called when the child process exited abnormally.
+fn childExitedAbnormally(
+    self: *Surface,
+    info: apprt.surface.Message.ChildExited,
+) !void {
+    var arena = ArenaAllocator.init(self.alloc);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    // Build up our command for the error message
+    const command = try std.mem.join(alloc, " ", switch (self.io.backend) {
+        .exec => |*exec| exec.subprocess.args,
+    });
+    const runtime_str = try std.fmt.allocPrint(alloc, "{d} ms", .{info.runtime_ms});
+
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t: *terminal.Terminal = self.renderer_state.terminal;
+
+    // No matter what move the cursor back to the column 0.
+    t.carriageReturn();
+
+    // Reset styles
+    try t.setAttribute(.{ .unset = {} });
+
+    // If there is data in the viewport, we want to scroll down
+    // a little bit and write a horizontal rule before writing
+    // our message. This lets the use see the error message the
+    // command may have output.
+    const viewport_str = try t.plainString(alloc);
+    if (viewport_str.len > 0) {
+        try t.linefeed();
+        for (0..t.cols) |_| try t.print(0x2501);
+        t.carriageReturn();
+        try t.linefeed();
+        try t.linefeed();
+    }
+
+    // Output our error message
+    try t.setAttribute(.{ .@"8_fg" = .bright_red });
+    try t.setAttribute(.{ .bold = {} });
+    try t.printString("Ghostty failed to launch the requested command:");
+    try t.setAttribute(.{ .unset = {} });
+
+    t.carriageReturn();
+    try t.linefeed();
+    try t.linefeed();
+    try t.printString(command);
+    try t.setAttribute(.{ .unset = {} });
+
+    t.carriageReturn();
+    try t.linefeed();
+    try t.linefeed();
+    try t.printString("Runtime: ");
+    try t.setAttribute(.{ .@"8_fg" = .red });
+    try t.printString(runtime_str);
+    try t.setAttribute(.{ .unset = {} });
+
+    // We don't print this on macOS because the exit code is always 0
+    // due to the way we launch the process.
+    if (comptime !builtin.target.os.tag.isDarwin()) {
+        const exit_code_str = try std.fmt.allocPrint(alloc, "{d}", .{info.exit_code});
+        t.carriageReturn();
+        try t.linefeed();
+        try t.printString("Exit Code: ");
+        try t.setAttribute(.{ .@"8_fg" = .red });
+        try t.printString(exit_code_str);
+        try t.setAttribute(.{ .unset = {} });
+    }
+
+    t.carriageReturn();
+    try t.linefeed();
+    try t.linefeed();
+    try t.printString("Press any key to close the window.");
+
+    // Hide the cursor
+    t.modes.set(.cursor_visible, false);
 }
 
 /// Called when the terminal detects there is a password input prompt.
@@ -1951,6 +2081,14 @@ pub fn keyCallback(
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
         if (self.io.terminal.modes.get(.disable_keyboard)) return .consumed;
+    }
+
+    // If our process is exited and we press a key then we close the
+    // surface. We may want to eventually move this to the apprt rather
+    // than in core.
+    if (self.child_exited and event.action == .press) {
+        self.close();
+        return .closed;
     }
 
     // If this input event has text, then we hide the mouse if configured.
@@ -3094,15 +3232,33 @@ pub fn mouseButtonCallback(
         }
     }
 
-    // Handle link clicking. We want to do this before we do mouse
-    // reporting or any other mouse handling because a successfully
-    // clicked link will swallow the event.
-    if (button == .left and action == .release and self.mouse.over_link) {
-        const pos = try self.rt_surface.getCursorPos();
-        if (self.processLinks(pos)) |processed| {
-            if (processed) return true;
-        } else |err| {
-            log.warn("error processing links err={}", .{err});
+    if (button == .left and action == .release) {
+        // The selection clipboard is only updated for left-click drag when
+        // the left button is released. This is to avoid the clipboard
+        // being updated on every mouse move which would be noisy.
+        if (self.config.copy_on_select != .false) {
+            self.renderer_state.mutex.lock();
+            defer self.renderer_state.mutex.unlock();
+            const prev_ = self.io.terminal.screen.selection;
+            if (prev_) |prev| {
+                try self.setSelection(terminal.Selection.init(
+                    prev.start(),
+                    prev.end(),
+                    false,
+                ));
+            }
+        }
+
+        // Handle link clicking. We want to do this before we do mouse
+        // reporting or any other mouse handling because a successfully
+        // clicked link will swallow the event.
+        if (self.mouse.over_link) {
+            const pos = try self.rt_surface.getCursorPos();
+            if (self.processLinks(pos)) |processed| {
+                if (processed) return true;
+            } else |err| {
+                log.warn("error processing links err={}", .{err});
+            }
         }
     }
 
@@ -3238,12 +3394,16 @@ pub fn mouseButtonCallback(
             log.err("error reading time, mouse multi-click won't work err={}", .{err});
         }
 
+        // In all cases below, we set the selection directly rather than use
+        // `setSelection` because we want to avoid copying the selection
+        // to the selection clipboard. For left mouse clicks we only set
+        // the clipboard on release.
         switch (self.mouse.left_click_count) {
             // Single click
             1 => {
                 // If we have a selection, clear it. This always happens.
                 if (self.io.terminal.screen.selection != null) {
-                    try self.setSelection(null);
+                    try self.io.terminal.screen.select(null);
                     try self.queueRender();
                 }
             },
@@ -3252,7 +3412,7 @@ pub fn mouseButtonCallback(
             2 => {
                 const sel_ = self.io.terminal.screen.selectWord(pin.*);
                 if (sel_) |sel| {
-                    try self.setSelection(sel);
+                    try self.io.terminal.screen.select(sel);
                     try self.queueRender();
                 }
             },
@@ -3264,7 +3424,7 @@ pub fn mouseButtonCallback(
                 else
                     self.io.terminal.screen.selectLine(.{ .pin = pin.* });
                 if (sel_) |sel| {
-                    try self.setSelection(sel);
+                    try self.io.terminal.screen.select(sel);
                     try self.queueRender();
                 }
             },
@@ -3549,7 +3709,7 @@ pub fn mousePressureCallback(
         // to handle state inconsistency here.
         const pin = self.mouse.left_click_pin orelse break :select;
         const sel = self.io.terminal.screen.selectWord(pin.*) orelse break :select;
-        try self.setSelection(sel);
+        try self.io.terminal.screen.select(sel);
         try self.queueRender();
     }
 }
@@ -3768,13 +3928,13 @@ fn dragLeftClickDouble(
     // If our current mouse position is before the starting position,
     // then the selection start is the word nearest our current position.
     if (drag_pin.before(click_pin)) {
-        try self.setSelection(terminal.Selection.init(
+        try self.io.terminal.screen.select(.init(
             word_current.start(),
             word_start.end(),
             false,
         ));
     } else {
-        try self.setSelection(terminal.Selection.init(
+        try self.io.terminal.screen.select(.init(
             word_start.start(),
             word_current.end(),
             false,
@@ -3806,7 +3966,7 @@ fn dragLeftClickTriple(
     } else {
         sel.endPtr().* = line.end();
     }
-    try self.setSelection(sel);
+    try self.io.terminal.screen.select(sel);
 }
 
 fn dragLeftClickSingle(
@@ -3815,7 +3975,7 @@ fn dragLeftClickSingle(
     drag_x: f64,
 ) !void {
     // This logic is in a separate function so that it can be unit tested.
-    try self.setSelection(mouseSelection(
+    try self.io.terminal.screen.select(mouseSelection(
         self.mouse.left_click_pin.?.*,
         drag_pin,
         @intFromFloat(@max(0.0, self.mouse.left_click_xpos)),
