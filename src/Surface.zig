@@ -951,6 +951,16 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
             };
         },
 
+        .progress_report => |v| {
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .progress_report,
+                v,
+            ) catch |err| {
+                log.warn("apprt failed to report progress err={}", .{err});
+            };
+        },
+
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();
@@ -1728,7 +1738,10 @@ pub fn selectionInfo(self: *const Surface) ?apprt.Selection {
 /// Returns the pwd of the terminal, if any. This is always copied because
 /// the pwd can change at any point from termio. If we are calling from the IO
 /// thread you should just check the terminal directly.
-pub fn pwd(self: *const Surface, alloc: Allocator) !?[]const u8 {
+pub fn pwd(
+    self: *const Surface,
+    alloc: Allocator,
+) Allocator.Error!?[]const u8 {
     self.renderer_state.mutex.lock();
     defer self.renderer_state.mutex.unlock();
     const terminal_pwd = self.io.terminal.getPwd() orelse return null;
