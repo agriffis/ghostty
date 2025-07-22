@@ -28,6 +28,7 @@ const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Config = @import("config.zig").Config;
 const Window = @import("window.zig").Window;
+const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
 
 const log = std.log.scoped(.gtk_ghostty_application);
@@ -109,6 +110,15 @@ pub const Application = extern struct {
         /// should exit and the application should quit. This must
         /// only be set by the main loop thread.
         running: bool = false,
+
+        /// The timer used to quit the application after the last window is
+        /// closed. Even if there is no quit delay set, this is the state
+        /// used to determine to close the app.
+        quit_timer: union(enum) {
+            off,
+            active: c_uint,
+            expired,
+        } = .off,
 
         /// If non-null, we're currently showing a config errors dialog.
         /// This is a WeakRef because the dialog can close on its own
@@ -309,6 +319,9 @@ pub const Application = extern struct {
 
         // The final cleanup that is always required at the end of running.
         defer {
+            // Ensure our timer source is removed
+            self.stopQuitTimer();
+
             // Sync any remaining settings
             gio.Settings.sync();
 
@@ -378,17 +391,62 @@ pub const Application = extern struct {
                 if (!config.@"quit-after-last-window-closed") break :q false;
 
                 // If the quit timer has expired, quit.
-                // if (self.quit_timer == .expired) break :q true;
+                if (priv.quit_timer == .expired) break :q true;
 
                 // There's no quit timer running, or it hasn't expired, don't quit.
                 break :q false;
             };
 
-            if (must_quit) {
-                //self.quit();
-                priv.running = false;
-            }
+            if (must_quit) self.quit();
         }
+    }
+
+    /// Quit the application. This will start the process to stop the
+    /// run loop. It will not `posix.exit`.
+    pub fn quit(self: *Self) void {
+        const priv = self.private();
+
+        // If our run loop has already exited then we are done.
+        if (!priv.running) return;
+
+        // If our core app doesn't need to confirm quit then we
+        // can exit immediately.
+        if (!priv.core_app.needsConfirmQuit()) {
+            self.quitNow();
+            return;
+        }
+
+        // Show a confirmation dialog
+        const dialog: *CloseConfirmationDialog = .new(.app);
+
+        // Connect to the reload signal so we know to reload our config.
+        _ = CloseConfirmationDialog.signals.@"close-request".connect(
+            dialog,
+            *Application,
+            handleCloseConfirmation,
+            self,
+            .{},
+        );
+
+        // Show it
+        dialog.present();
+    }
+
+    fn quitNow(self: *Self) void {
+        // Get all our windows and destroy them, forcing them to
+        // free their memory.
+        const list = gtk.Window.listToplevels();
+        defer list.free();
+        list.foreach(struct {
+            fn callback(data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
+                const ptr = data orelse return;
+                const window: *gtk.Window = @ptrCast(@alignCast(ptr));
+                window.destroy();
+            }
+        }.callback, null);
+
+        // Trigger our runloop exit.
+        self.private().running = false;
     }
 
     /// apprt API to perform an action.
@@ -405,6 +463,7 @@ pub const Application = extern struct {
                 value.config,
             ),
 
+            .mouse_over_link => Action.mouseOverLink(target, value),
             .mouse_shape => Action.mouseShape(target, value),
             .mouse_visibility => Action.mouseVisibility(target, value),
 
@@ -416,12 +475,19 @@ pub const Application = extern struct {
                 },
             ),
 
+            .pwd => Action.pwd(target, value),
+
+            .quit => self.quit(),
+
             .quit_timer => try Action.quitTimer(self, value),
 
             .render => Action.render(self, target),
 
-            // Unimplemented
-            .quit,
+            .set_title => Action.setTitle(target, value),
+
+            .show_gtk_inspector => Action.showGtkInspector(),
+
+            // Unimplemented but todo on gtk-ng branch
             .close_window,
             .toggle_maximize,
             .toggle_fullscreen,
@@ -436,20 +502,15 @@ pub const Application = extern struct {
             .open_config,
             .reload_config,
             .inspector,
-            .show_gtk_inspector,
             .desktop_notification,
-            .set_title,
-            .pwd,
             .present_terminal,
             .initial_size,
             .size_limit,
-            .mouse_over_link,
             .toggle_tab_overview,
             .toggle_split_zoom,
             .toggle_window_decorations,
             .prompt_title,
             .toggle_quick_terminal,
-            .secure_input,
             .ring_bell,
             .toggle_command_palette,
             .open_url,
@@ -467,6 +528,13 @@ pub const Application = extern struct {
             .undo,
             .redo,
             .progress_report,
+            => {
+                log.warn("unimplemented action={}", .{action});
+                return false;
+            },
+
+            // Unimplemented
+            .secure_input,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
@@ -515,6 +583,56 @@ pub const Application = extern struct {
     /// Returns the app winproto implementation.
     pub fn winproto(self: *Self) *winprotopkg.App {
         return &self.private().winproto;
+    }
+
+    /// Returns the cgroup base (if any).
+    pub fn cgroupBase(self: *Self) ?[]const u8 {
+        return self.private().transient_cgroup_base;
+    }
+
+    /// This will get called when there are no more open surfaces.
+    fn startQuitTimer(self: *Self) void {
+        const priv = self.private();
+        const config = priv.config.get();
+
+        // Cancel any previous timer.
+        self.stopQuitTimer();
+
+        // This is a no-op unless we are configured to quit after last window is closed.
+        if (!config.@"quit-after-last-window-closed") return;
+
+        // If a delay is configured, set a timeout function to quit after the delay.
+        if (config.@"quit-after-last-window-closed-delay") |v| {
+            priv.quit_timer = .{
+                .active = glib.timeoutAdd(
+                    v.asMilliseconds(),
+                    handleQuitTimerExpired,
+                    self,
+                ),
+            };
+        } else {
+            // If no delay is configured, treat it as expired.
+            priv.quit_timer = .expired;
+        }
+    }
+
+    /// This will get called when a new surface gets opened.
+    fn stopQuitTimer(self: *Self) void {
+        const priv = self.private();
+        switch (priv.quit_timer) {
+            .off => {},
+            .expired => priv.quit_timer = .off,
+            .active => |source| {
+                if (glib.Source.remove(source) == 0) {
+                    log.warn(
+                        "unable to remove quit timer source={d}",
+                        .{source},
+                    );
+                }
+
+                priv.quit_timer = .off;
+            },
+        }
     }
 
     //---------------------------------------------------------------
@@ -736,6 +854,20 @@ pub const Application = extern struct {
     //---------------------------------------------------------------
     // Signal Handlers
 
+    fn handleCloseConfirmation(
+        _: *CloseConfirmationDialog,
+        self: *Self,
+    ) callconv(.c) void {
+        self.quitNow();
+    }
+
+    fn handleQuitTimerExpired(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud));
+        const priv = self.private();
+        priv.quit_timer = .expired;
+        return 0;
+    }
+
     fn handleStyleManagerDark(
         style: *adw.StyleManager,
         _: *gobject.ParamSpec,
@@ -888,6 +1020,25 @@ const Action = struct {
         }
     }
 
+    pub fn mouseOverLink(
+        target: apprt.Target,
+        value: apprt.action.MouseOverLink,
+    ) void {
+        switch (target) {
+            .app => log.warn("mouse over link to app is unexpected", .{}),
+            .surface => |surface| {
+                var v = gobject.ext.Value.new([:0]const u8);
+                if (value.url.len > 0) gobject.ext.Value.set(&v, value.url);
+                defer v.unset();
+                gobject.Object.setProperty(
+                    surface.rt_surface.gobj().as(gobject.Object),
+                    "mouse-hover-url",
+                    &v,
+                );
+            },
+        }
+    }
+
     pub fn mouseShape(
         target: apprt.Target,
         shape: terminal.MouseShape,
@@ -937,18 +1088,31 @@ const Action = struct {
         gtk.Window.present(win.as(gtk.Window));
     }
 
+    pub fn pwd(
+        target: apprt.Target,
+        value: apprt.action.Pwd,
+    ) void {
+        switch (target) {
+            .app => log.warn("pwd to app is unexpected", .{}),
+            .surface => |surface| {
+                var v = gobject.ext.Value.newFrom(value.pwd);
+                defer v.unset();
+                gobject.Object.setProperty(
+                    surface.rt_surface.gobj().as(gobject.Object),
+                    "pwd",
+                    &v,
+                );
+            },
+        }
+    }
+
     pub fn quitTimer(
         self: *Application,
         mode: apprt.action.QuitTimer,
     ) !void {
-        // TODO: An actual quit timer implementation. For now, we immediately
-        // quit on no windows regardless of the config.
         switch (mode) {
-            .start => {
-                self.private().running = false;
-            },
-
-            .stop => {},
+            .start => self.startQuitTimer(),
+            .stop => self.stopQuitTimer(),
         }
     }
 
@@ -957,6 +1121,28 @@ const Action = struct {
             .app => {},
             .surface => |v| v.rt_surface.surface.redraw(),
         }
+    }
+
+    pub fn setTitle(
+        target: apprt.Target,
+        value: apprt.action.SetTitle,
+    ) void {
+        switch (target) {
+            .app => log.warn("set_title to app is unexpected", .{}),
+            .surface => |surface| {
+                var v = gobject.ext.Value.newFrom(value.title);
+                defer v.unset();
+                gobject.Object.setProperty(
+                    surface.rt_surface.gobj().as(gobject.Object),
+                    "title",
+                    &v,
+                );
+            },
+        }
+    }
+
+    pub fn showGtkInspector() void {
+        gtk.Window.setInteractiveDebugging(@intFromBool(true));
     }
 };
 

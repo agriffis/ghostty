@@ -16,6 +16,9 @@ pub const app_id = "com.mitchellh.ghostty";
 /// minimum adwaita version.
 pub const ui_path = "src/apprt/gtk-ng/ui";
 
+/// The path to the CSS files.
+pub const css_path = "src/apprt/gtk-ng/css";
+
 /// The possible icon sizes we'll embed into the gresource file.
 /// If any size doesn't exist then it will be an error. We could
 /// infer this completely from available files but we wouldn't be
@@ -30,9 +33,19 @@ pub const icon_sizes: []const comptime_int = &.{ 16, 32, 128, 256, 512, 1024 };
 ///
 /// These will be asserted to exist at runtime.
 pub const blueprints: []const Blueprint = &.{
+    .{ .major = 1, .minor = 2, .name = "close-confirmation-dialog" },
     .{ .major = 1, .minor = 2, .name = "config-errors-dialog" },
+    .{ .major = 1, .minor = 2, .name = "resize-overlay" },
     .{ .major = 1, .minor = 2, .name = "surface" },
     .{ .major = 1, .minor = 5, .name = "window" },
+};
+
+/// CSS files in css_path
+pub const css = [_][]const u8{
+    "style.css",
+    // "style-dark.css",
+    // "style-hc.css",
+    // "style-hc-dark.css",
 };
 
 pub const Blueprint = struct {
@@ -44,7 +57,7 @@ pub const Blueprint = struct {
 /// The list of filepaths that we depend on. Used for the build
 /// system to have proper caching.
 pub const file_inputs = deps: {
-    const total = (icon_sizes.len * 2) + blueprints.len;
+    const total = (icon_sizes.len * 2) + blueprints.len + css.len;
     var deps: [total][]const u8 = undefined;
     var index: usize = 0;
     for (icon_sizes) |size| {
@@ -59,6 +72,10 @@ pub const file_inputs = deps: {
             bp.minor,
             bp.name,
         });
+        index += 1;
+    }
+    for (css) |name| {
+        deps[index] = std.fmt.comptimePrint("{s}/{s}", .{ css_path, name });
         index += 1;
     }
     break :deps deps;
@@ -119,6 +136,7 @@ pub fn main() !void {
         \\
     );
 
+    try genRoot(writer);
     try genIcons(writer);
     try genUi(alloc, writer, &ui_files);
 
@@ -164,6 +182,34 @@ fn genIcons(writer: anytype) !void {
                 .{ alias, app_id, source },
             );
         }
+    }
+
+    try writer.writeAll(
+        \\  </gresource>
+        \\
+    );
+}
+
+/// Generate the resources at the root prefix.
+fn genRoot(writer: anytype) !void {
+    try writer.print(
+        \\  <gresource prefix="{s}">
+        \\
+    , .{prefix});
+
+    const cwd = std.fs.cwd();
+    inline for (css) |name| {
+        const source = std.fmt.comptimePrint(
+            "{s}/{s}",
+            .{ css_path, name },
+        );
+        try cwd.access(source, .{});
+        try writer.print(
+            \\    <file compressed="true" alias="{s}">{s}</file>
+            \\
+        ,
+            .{ name, source },
+        );
     }
 
     try writer.writeAll(

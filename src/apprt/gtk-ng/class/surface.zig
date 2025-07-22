@@ -19,6 +19,7 @@ const ApprtSurface = @import("../Surface.zig");
 const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Config = @import("config.zig").Config;
+const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -93,6 +94,57 @@ pub const Surface = extern struct {
                 },
             );
         };
+
+        pub const @"mouse-hover-url" = struct {
+            pub const name = "mouse-hover-url";
+            pub const get = impl.get;
+            pub const set = impl.set;
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .nick = "Mouse Hover URL",
+                    .blurb = "The URL the mouse is currently hovering over (if any).",
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("mouse_hover_url"),
+                },
+            );
+        };
+
+        pub const pwd = struct {
+            pub const name = "pwd";
+            pub const get = impl.get;
+            pub const set = impl.set;
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .nick = "Working Directory",
+                    .blurb = "The current working directory as reported by core.",
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("pwd"),
+                },
+            );
+        };
+
+        pub const title = struct {
+            pub const name = "title";
+            pub const get = impl.get;
+            pub const set = impl.set;
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?[:0]const u8,
+                .{
+                    .nick = "Title",
+                    .blurb = "The title of the surface.",
+                    .default = null,
+                    .accessor = C.privateStringFieldAccessor("title"),
+                },
+            );
+        };
     };
 
     pub const signals = struct {
@@ -122,15 +174,41 @@ pub const Surface = extern struct {
         /// The configuration that this surface is using.
         config: ?*Config = null,
 
+        /// The cgroup created for this surface. This will be created
+        /// if `Application.transient_cgroup_base` is set.
+        cgroup_path: ?[]const u8 = null,
+
         /// The mouse shape to show for the surface.
         mouse_shape: terminal.MouseShape = .default,
 
         /// Whether the mouse should be hidden or not as requested externally.
         mouse_hidden: bool = false,
 
+        /// The URL that the mouse is currently hovering over.
+        mouse_hover_url: ?[:0]const u8 = null,
+
+        /// The current working directory. This has to be reported externally,
+        /// usually by shell integration which then talks to libghostty
+        /// which triggers this property.
+        pwd: ?[:0]const u8 = null,
+
+        /// The title of this surface, if any has been set.
+        title: ?[:0]const u8 = null,
+
+        /// The overlay we use for things such as the URL hover label
+        /// or resize box. Bound from the template.
+        overlay: *gtk.Overlay = undefined,
+
         /// The GLAarea that renders the actual surface. This is a binding
         /// to the template so it doesn't have to be unrefed manually.
         gl_area: *gtk.GLArea = undefined,
+
+        /// The labels for the left/right sides of the URL hover tooltip.
+        url_left: *gtk.Label = undefined,
+        url_right: *gtk.Label = undefined,
+
+        /// The resize overlay
+        resize_overlay: *ResizeOverlay = undefined,
 
         /// The apprt Surface.
         rt_surface: ApprtSurface = undefined,
@@ -441,6 +519,63 @@ pub const Surface = extern struct {
         };
     }
 
+    /// Initialize the cgroup for this surface if it hasn't been
+    /// already. While this is `init`-prefixed, we prefer to call this
+    /// in the realize function because we don't need to create a cgroup
+    /// if we don't init a surface.
+    fn initCgroup(self: *Self) void {
+        const priv = self.private();
+
+        // If we already have a cgroup path then we don't do it again.
+        if (priv.cgroup_path != null) return;
+
+        const app = Application.default();
+        const alloc = app.allocator();
+        const base = app.cgroupBase() orelse return;
+
+        // For the unique group name we use the self pointer. This may
+        // not be a good idea for security reasons but not sure yet. We
+        // may want to change this to something else eventually to be safe.
+        var buf: [256]u8 = undefined;
+        const name = std.fmt.bufPrint(
+            &buf,
+            "surfaces/{X}.scope",
+            .{@intFromPtr(self)},
+        ) catch unreachable;
+
+        // Create the cgroup. If it fails, no big deal... just ignore.
+        internal_os.cgroup.create(base, name, null) catch |err| {
+            log.warn("failed to create surface cgroup err={}", .{err});
+            return;
+        };
+
+        // Success, save the cgroup path.
+        priv.cgroup_path = std.fmt.allocPrint(
+            alloc,
+            "{s}/{s}",
+            .{ base, name },
+        ) catch null;
+    }
+
+    /// Deletes the cgroup if set.
+    fn clearCgroup(self: *Self) void {
+        const priv = self.private();
+        const path = priv.cgroup_path orelse return;
+
+        internal_os.cgroup.remove(path) catch |err| {
+            // We don't want this to be fatal in any way so we just log
+            // and continue. A dangling empty cgroup is not a big deal
+            // and this should be rare.
+            log.warn(
+                "failed to remove cgroup for surface path={s} err={}",
+                .{ path, err },
+            );
+        };
+
+        Application.default().allocator().free(path);
+        priv.cgroup_path = null;
+    }
+
     //---------------------------------------------------------------
     // Libghostty Callbacks
 
@@ -451,6 +586,10 @@ pub const Surface = extern struct {
             .{process_active},
             null,
         );
+    }
+
+    pub fn cgroupPath(self: *Self) ?[]const u8 {
+        return self.private().cgroup_path;
     }
 
     pub fn getContentScale(self: *Self) apprt.ContentScale {
@@ -770,6 +909,20 @@ pub const Surface = extern struct {
         _ = gobject.Object.signals.notify.connect(
             self,
             ?*anyopaque,
+            &propConfig,
+            null,
+            .{ .detail = "config" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            self,
+            ?*anyopaque,
+            &propMouseHoverUrl,
+            null,
+            .{ .detail = "mouse-hover-url" },
+        );
+        _ = gobject.Object.signals.notify.connect(
+            self,
+            ?*anyopaque,
             &propMouseHidden,
             null,
             .{ .detail = "mouse-hidden" },
@@ -780,6 +933,51 @@ pub const Surface = extern struct {
             &propMouseShape,
             null,
             .{ .detail = "mouse-shape" },
+        );
+
+        // Some other initialization steps
+        self.initUrlOverlay();
+        self.initResizeOverlay();
+
+        // Initialize our config
+        self.propConfig(undefined, null);
+    }
+
+    fn initResizeOverlay(self: *Self) void {
+        const priv = self.private();
+        const overlay = priv.overlay;
+        overlay.addOverlay(priv.resize_overlay.as(gtk.Widget));
+    }
+
+    fn initUrlOverlay(self: *Self) void {
+        const priv = self.private();
+        const overlay = priv.overlay;
+        const url_left = priv.url_left.as(gtk.Widget);
+        const url_right = priv.url_right.as(gtk.Widget);
+
+        // Add the url label to the overlay
+        overlay.addOverlay(url_left);
+        overlay.addOverlay(url_right);
+
+        // Setup a motion controller to handle moving the label
+        // to avoid the mouse.
+        const ec_motion = gtk.EventControllerMotion.new();
+        errdefer ec_motion.unref();
+        url_left.addController(ec_motion.as(gtk.EventController));
+        errdefer url_left.removeController(ec_motion.as(gtk.EventController));
+        _ = gtk.EventControllerMotion.signals.enter.connect(
+            ec_motion,
+            *Self,
+            ecUrlMouseEnter,
+            self,
+            .{},
+        );
+        _ = gtk.EventControllerMotion.signals.leave.connect(
+            ec_motion,
+            *Self,
+            ecUrlMouseLeave,
+            self,
+            .{},
         );
     }
 
@@ -820,6 +1018,19 @@ pub const Surface = extern struct {
 
             priv.core_surface = null;
         }
+        if (priv.mouse_hover_url) |v| {
+            glib.free(@constCast(@ptrCast(v)));
+            priv.mouse_hover_url = null;
+        }
+        if (priv.pwd) |v| {
+            glib.free(@constCast(@ptrCast(v)));
+            priv.pwd = null;
+        }
+        if (priv.title) |v| {
+            glib.free(@constCast(@ptrCast(v)));
+            priv.title = null;
+        }
+        self.clearCgroup();
 
         gobject.Object.virtual_methods.finalize.call(
             Class.parent,
@@ -829,6 +1040,73 @@ pub const Surface = extern struct {
 
     //---------------------------------------------------------------
     // Properties
+
+    /// Returns the title property without a copy.
+    pub fn getTitle(self: *Self) ?[:0]const u8 {
+        return self.private().title;
+    }
+
+    fn propConfig(
+        self: *Self,
+        _: *gobject.ParamSpec,
+        _: ?*anyopaque,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const config = if (priv.config) |c| c.get() else return;
+
+        // resize-overlay-duration
+        {
+            const ms = config.@"resize-overlay-duration".asMilliseconds();
+            var value = gobject.ext.Value.newFrom(ms);
+            defer value.unset();
+            gobject.Object.setProperty(
+                priv.resize_overlay.as(gobject.Object),
+                "duration",
+                &value,
+            );
+        }
+
+        // resize-overlay-position
+        {
+            const hv: struct {
+                gtk.Align, // halign
+                gtk.Align, // valign
+            } = switch (config.@"resize-overlay-position") {
+                .center => .{ .center, .center },
+                .@"top-left" => .{ .start, .start },
+                .@"top-right" => .{ .end, .start },
+                .@"top-center" => .{ .center, .start },
+                .@"bottom-left" => .{ .start, .end },
+                .@"bottom-right" => .{ .end, .end },
+                .@"bottom-center" => .{ .center, .end },
+            };
+
+            var halign = gobject.ext.Value.newFrom(hv[0]);
+            defer halign.unset();
+            var valign = gobject.ext.Value.newFrom(hv[1]);
+            defer valign.unset();
+            gobject.Object.setProperty(
+                priv.resize_overlay.as(gobject.Object),
+                "overlay-halign",
+                &halign,
+            );
+            gobject.Object.setProperty(
+                priv.resize_overlay.as(gobject.Object),
+                "overlay-valign",
+                &valign,
+            );
+        }
+    }
+
+    fn propMouseHoverUrl(
+        self: *Self,
+        _: *gobject.ParamSpec,
+        _: ?*anyopaque,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const visible = if (priv.mouse_hover_url) |v| v.len > 0 else false;
+        priv.url_left.as(gtk.Widget).setVisible(if (visible) 1 else 0);
+    }
 
     fn propMouseHidden(
         self: *Self,
@@ -1416,7 +1694,42 @@ pub const Surface = extern struct {
             surface.sizeCallback(priv.size) catch |err| {
                 log.warn("error in size callback err={}", .{err});
             };
+
+            // Setup our resize overlay if configured
+            self.resizeOverlaySchedule();
         }
+    }
+
+    fn resizeOverlaySchedule(self: *Self) void {
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+
+        // Only show the resize overlay if its enabled
+        const config = if (priv.config) |c| c.get() else return;
+        switch (config.@"resize-overlay") {
+            .always, .@"after-first" => {},
+            .never => return,
+        }
+
+        // If we have resize overlays enabled, setup an idler
+        // to show that. We do this in an idle tick because doing it
+        // during the resize results in flickering.
+        var buf: [32]u8 = undefined;
+        priv.resize_overlay.setLabel(text: {
+            const grid_size = surface.size.grid();
+            break :text std.fmt.bufPrintZ(
+                &buf,
+                "{d} x {d}",
+                .{
+                    grid_size.columns,
+                    grid_size.rows,
+                },
+            ) catch |err| err: {
+                log.warn("unable to format text: {}", .{err});
+                break :err "";
+            };
+        });
+        priv.resize_overlay.schedule();
     }
 
     const RealizeError = Allocator.Error || error{
@@ -1449,9 +1762,14 @@ pub const Surface = extern struct {
             return;
         }
 
-        // Make our pointer to store our surface
         const app = Application.default();
         const alloc = app.allocator();
+
+        // Initialize our cgroup if we can.
+        self.initCgroup();
+        errdefer self.clearCgroup();
+
+        // Make our pointer to store our surface
         const surface = try alloc.create(CoreSurface);
         errdefer alloc.destroy(surface);
 
@@ -1483,6 +1801,26 @@ pub const Surface = extern struct {
         priv.core_surface = surface;
     }
 
+    fn ecUrlMouseEnter(
+        _: *gtk.EventControllerMotion,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const right = priv.url_right.as(gtk.Widget);
+        right.setVisible(1);
+    }
+
+    fn ecUrlMouseLeave(
+        _: *gtk.EventControllerMotion,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const right = priv.url_right.as(gtk.Widget);
+        right.setVisible(0);
+    }
+
     const C = Common(Self, Private);
     pub const as = C.as;
     pub const ref = C.ref;
@@ -1495,6 +1833,7 @@ pub const Surface = extern struct {
         pub const Instance = Self;
 
         fn init(class: *Class) callconv(.C) void {
+            gobject.ext.ensureType(ResizeOverlay);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
@@ -1505,13 +1844,20 @@ pub const Surface = extern struct {
             );
 
             // Bindings
+            class.bindTemplateChildPrivate("overlay", .{});
             class.bindTemplateChildPrivate("gl_area", .{});
+            class.bindTemplateChildPrivate("url_left", .{});
+            class.bindTemplateChildPrivate("url_right", .{});
+            class.bindTemplateChildPrivate("resize_overlay", .{});
 
             // Properties
             gobject.ext.registerProperties(class, &.{
                 properties.config.impl,
                 properties.@"mouse-shape".impl,
                 properties.@"mouse-hidden".impl,
+                properties.@"mouse-hover-url".impl,
+                properties.pwd.impl,
+                properties.title.impl,
             });
 
             // Signals
