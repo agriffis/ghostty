@@ -114,6 +114,24 @@ pub fn Common(
                     );
                 }
             }).bindTemplateChildPrivate else {};
+
+            /// Bind a function pointer to a template callback symbol.
+            pub fn bindTemplateCallback(
+                class: *Self.Class,
+                comptime name: [:0]const u8,
+                comptime func: anytype,
+            ) void {
+                // TODO: We can do a lot more verification here of `func`:
+                // - should be a function pointer
+                // - should be callconv C
+                // etc.
+
+                gtk.Widget.Class.bindTemplateCallbackFull(
+                    class.as(gtk.Widget.Class),
+                    name,
+                    @ptrCast(func),
+                );
+            }
         };
     };
 }
