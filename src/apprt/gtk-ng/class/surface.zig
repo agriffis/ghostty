@@ -2,6 +2,7 @@ const std = @import("std");
 const Allocator = std.mem.Allocator;
 const adw = @import("adw");
 const gdk = @import("gdk");
+const gio = @import("gio");
 const glib = @import("glib");
 const gobject = @import("gobject");
 const gtk = @import("gtk");
@@ -20,6 +21,7 @@ const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Config = @import("config.zig").Config;
 const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
+const ClipboardConfirmationDialog = @import("clipboard_confirmation_dialog.zig").ClipboardConfirmationDialog;
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -50,6 +52,26 @@ pub const Surface = extern struct {
                         Private,
                         &Private.offset,
                         "config",
+                    ),
+                },
+            );
+        };
+
+        pub const focused = struct {
+            pub const name = "focused";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .nick = "Focused",
+                    .blurb = "The focused state of the surface.",
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "focused",
                     ),
                 },
             );
@@ -168,6 +190,30 @@ pub const Surface = extern struct {
                 void,
             );
         };
+
+        /// Emitted whenever the clipboard has been written.
+        pub const @"clipboard-write" = struct {
+            pub const name = "clipboard-write";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{},
+                void,
+            );
+        };
+
+        /// Emitted whenever the surface reads the clipboard.
+        pub const @"clipboard-read" = struct {
+            pub const name = "clipboard-read";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{},
+                void,
+            );
+        };
     };
 
     const Private = struct {
@@ -195,20 +241,32 @@ pub const Surface = extern struct {
         /// The title of this surface, if any has been set.
         title: ?[:0]const u8 = null,
 
+        /// The current focus state of the terminal based on the
+        /// focus events.
+        focused: bool = true,
+
         /// The overlay we use for things such as the URL hover label
         /// or resize box. Bound from the template.
-        overlay: *gtk.Overlay = undefined,
+        overlay: *gtk.Overlay,
 
         /// The GLAarea that renders the actual surface. This is a binding
         /// to the template so it doesn't have to be unrefed manually.
-        gl_area: *gtk.GLArea = undefined,
+        gl_area: *gtk.GLArea,
 
         /// The labels for the left/right sides of the URL hover tooltip.
-        url_left: *gtk.Label = undefined,
-        url_right: *gtk.Label = undefined,
+        url_left: *gtk.Label,
+        url_right: *gtk.Label,
+        url_ec_motion: *gtk.EventControllerMotion,
 
         /// The resize overlay
-        resize_overlay: *ResizeOverlay = undefined,
+        resize_overlay: *ResizeOverlay,
+
+        // Event controllers
+        ec_focus: *gtk.EventControllerFocus,
+        ec_key: *gtk.EventControllerKey,
+        ec_motion: *gtk.EventControllerMotion,
+        ec_scroll: *gtk.EventControllerScroll,
+        gesture_click: *gtk.GestureClick,
 
         /// The apprt Surface.
         rt_surface: ApprtSurface = undefined,
@@ -690,6 +748,32 @@ pub const Surface = extern struct {
         return env;
     }
 
+    pub fn clipboardRequest(
+        self: *Self,
+        clipboard_type: apprt.Clipboard,
+        state: apprt.ClipboardRequest,
+    ) !void {
+        try Clipboard.request(
+            self,
+            clipboard_type,
+            state,
+        );
+    }
+
+    pub fn setClipboardString(
+        self: *Self,
+        val: [:0]const u8,
+        clipboard_type: apprt.Clipboard,
+        confirm: bool,
+    ) void {
+        Clipboard.set(
+            self,
+            val,
+            clipboard_type,
+            confirm,
+        );
+    }
+
     //---------------------------------------------------------------
     // Virtual Methods
 
@@ -704,6 +788,7 @@ pub const Surface = extern struct {
         priv.cursor_pos = .{ .x = 0, .y = 0 };
         priv.mouse_shape = .text;
         priv.mouse_hidden = false;
+        priv.focused = true;
         priv.size = .{
             // Funky numbers on purpose so they stand out if for some reason
             // our size doesn't get properly set.
@@ -718,22 +803,16 @@ pub const Surface = extern struct {
             priv.config = app.getConfig();
         }
 
-        const self_widget = self.as(gtk.Widget);
-
         // Setup our event controllers to get input events
-        const ec_key = gtk.EventControllerKey.new();
-        errdefer ec_key.unref();
-        self_widget.addController(ec_key.as(gtk.EventController));
-        errdefer self_widget.removeController(ec_key.as(gtk.EventController));
         _ = gtk.EventControllerKey.signals.key_pressed.connect(
-            ec_key,
+            priv.ec_key,
             *Self,
             ecKeyPressed,
             self,
             .{},
         );
         _ = gtk.EventControllerKey.signals.key_released.connect(
-            ec_key,
+            priv.ec_key,
             *Self,
             ecKeyReleased,
             self,
@@ -741,19 +820,15 @@ pub const Surface = extern struct {
         );
 
         // Focus controller will tell us about focus enter/exit events
-        const ec_focus = gtk.EventControllerFocus.new();
-        errdefer ec_focus.unref();
-        self_widget.addController(ec_focus.as(gtk.EventController));
-        errdefer self_widget.removeController(ec_focus.as(gtk.EventController));
         _ = gtk.EventControllerFocus.signals.enter.connect(
-            ec_focus,
+            priv.ec_focus,
             *Self,
             ecFocusEnter,
             self,
             .{},
         );
         _ = gtk.EventControllerFocus.signals.leave.connect(
-            ec_focus,
+            priv.ec_focus,
             *Self,
             ecFocusLeave,
             self,
@@ -761,20 +836,15 @@ pub const Surface = extern struct {
         );
 
         // Clicks
-        const gesture_click = gtk.GestureClick.new();
-        errdefer gesture_click.unref();
-        gesture_click.as(gtk.GestureSingle).setButton(0);
-        self_widget.addController(gesture_click.as(gtk.EventController));
-        errdefer self_widget.removeController(gesture_click.as(gtk.EventController));
         _ = gtk.GestureClick.signals.pressed.connect(
-            gesture_click,
+            priv.gesture_click,
             *Self,
             gcMouseDown,
             self,
             .{},
         );
         _ = gtk.GestureClick.signals.released.connect(
-            gesture_click,
+            priv.gesture_click,
             *Self,
             gcMouseUp,
             self,
@@ -782,19 +852,15 @@ pub const Surface = extern struct {
         );
 
         // Mouse movement
-        const ec_motion = gtk.EventControllerMotion.new();
-        errdefer ec_motion.unref();
-        self_widget.addController(ec_motion.as(gtk.EventController));
-        errdefer self_widget.removeController(ec_motion.as(gtk.EventController));
         _ = gtk.EventControllerMotion.signals.motion.connect(
-            ec_motion,
+            priv.ec_motion,
             *Self,
             ecMouseMotion,
             self,
             .{},
         );
         _ = gtk.EventControllerMotion.signals.leave.connect(
-            ec_motion,
+            priv.ec_motion,
             *Self,
             ecMouseLeave,
             self,
@@ -802,26 +868,22 @@ pub const Surface = extern struct {
         );
 
         // Scroll
-        const ec_scroll = gtk.EventControllerScroll.new(.flags_both_axes);
-        errdefer ec_scroll.unref();
-        self_widget.addController(ec_scroll.as(gtk.EventController));
-        errdefer self_widget.removeController(ec_scroll.as(gtk.EventController));
         _ = gtk.EventControllerScroll.signals.scroll.connect(
-            ec_scroll,
+            priv.ec_scroll,
             *Self,
             ecMouseScroll,
             self,
             .{},
         );
         _ = gtk.EventControllerScroll.signals.scroll_begin.connect(
-            ec_scroll,
+            priv.ec_scroll,
             *Self,
             ecMouseScrollPrecisionBegin,
             self,
             .{},
         );
         _ = gtk.EventControllerScroll.signals.scroll_end.connect(
-            ec_scroll,
+            priv.ec_scroll,
             *Self,
             ecMouseScrollPrecisionEnd,
             self,
@@ -937,43 +999,25 @@ pub const Surface = extern struct {
 
         // Some other initialization steps
         self.initUrlOverlay();
-        self.initResizeOverlay();
 
         // Initialize our config
         self.propConfig(undefined, null);
     }
 
-    fn initResizeOverlay(self: *Self) void {
-        const priv = self.private();
-        const overlay = priv.overlay;
-        overlay.addOverlay(priv.resize_overlay.as(gtk.Widget));
-    }
-
     fn initUrlOverlay(self: *Self) void {
         const priv = self.private();
-        const overlay = priv.overlay;
-        const url_left = priv.url_left.as(gtk.Widget);
-        const url_right = priv.url_right.as(gtk.Widget);
-
-        // Add the url label to the overlay
-        overlay.addOverlay(url_left);
-        overlay.addOverlay(url_right);
 
         // Setup a motion controller to handle moving the label
         // to avoid the mouse.
-        const ec_motion = gtk.EventControllerMotion.new();
-        errdefer ec_motion.unref();
-        url_left.addController(ec_motion.as(gtk.EventController));
-        errdefer url_left.removeController(ec_motion.as(gtk.EventController));
         _ = gtk.EventControllerMotion.signals.enter.connect(
-            ec_motion,
+            priv.url_ec_motion,
             *Self,
             ecUrlMouseEnter,
             self,
             .{},
         );
         _ = gtk.EventControllerMotion.signals.leave.connect(
-            ec_motion,
+            priv.url_ec_motion,
             *Self,
             ecUrlMouseLeave,
             self,
@@ -1215,30 +1259,41 @@ pub const Surface = extern struct {
 
     fn ecFocusEnter(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
         const priv = self.private();
+        priv.focused = true;
 
         if (priv.im_context) |im_context| {
             im_context.as(gtk.IMContext).focusIn();
         }
 
-        if (priv.core_surface) |surface| {
-            surface.focusCallback(true) catch |err| {
-                log.warn("error in focus callback err={}", .{err});
-            };
-        }
+        _ = glib.idleAddOnce(idleFocus, self.ref());
     }
 
     fn ecFocusLeave(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
         const priv = self.private();
+        priv.focused = false;
 
         if (priv.im_context) |im_context| {
             im_context.as(gtk.IMContext).focusOut();
         }
 
-        if (priv.core_surface) |surface| {
-            surface.focusCallback(false) catch |err| {
-                log.warn("error in focus callback err={}", .{err});
-            };
-        }
+        _ = glib.idleAddOnce(idleFocus, self.ref());
+    }
+
+    /// The focus callback must be triggered on an idle loop source because
+    /// there are actions within libghostty callbacks (such as showing close
+    /// confirmation dialogs) that can trigger focus loss and cause a deadlock
+    /// because the lock may be held during the callback.
+    ///
+    /// Userdata should be a `*Surface`. This will unref once.
+    fn idleFocus(ud: ?*anyopaque) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return));
+        defer self.unref();
+
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+        surface.focusCallback(priv.focused) catch |err| {
+            log.warn("error in focus callback err={}", .{err});
+        };
     }
 
     fn gcMouseDown(
@@ -1850,9 +1905,28 @@ pub const Surface = extern struct {
             class.bindTemplateChildPrivate("url_right", .{});
             class.bindTemplateChildPrivate("resize_overlay", .{});
 
+            // EventControllers don't work with our helper.
+            // https://github.com/ianprime0509/zig-gobject/issues/111
+            inline for (&.{
+                "ec_focus",
+                "ec_key",
+                "ec_motion",
+                "ec_scroll",
+                "gesture_click",
+                "url_ec_motion",
+            }) |name| {
+                gtk.Widget.Class.bindTemplateChildFull(
+                    gobject.ext.as(gtk.Widget.Class, class),
+                    name,
+                    @intFromBool(false),
+                    Private.offset + @offsetOf(Private, name),
+                );
+            }
+
             // Properties
             gobject.ext.registerProperties(class, &.{
                 properties.config.impl,
+                properties.focused.impl,
                 properties.@"mouse-shape".impl,
                 properties.@"mouse-hidden".impl,
                 properties.@"mouse-hover-url".impl,
@@ -1862,6 +1936,8 @@ pub const Surface = extern struct {
 
             // Signals
             signals.@"close-request".impl.register(.{});
+            signals.@"clipboard-read".impl.register(.{});
+            signals.@"clipboard-write".impl.register(.{});
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
@@ -1903,3 +1979,255 @@ fn translateMouseButton(button: c_uint) input.MouseButton {
         else => .unknown,
     };
 }
+
+/// A namespace for our clipboard-related functions so Surface isn't SO large.
+const Clipboard = struct {
+    /// Get the specific type of clipboard for a widget.
+    pub fn get(
+        widget: *gtk.Widget,
+        clipboard: apprt.Clipboard,
+    ) ?*gdk.Clipboard {
+        return switch (clipboard) {
+            .standard => widget.getClipboard(),
+            .selection, .primary => widget.getPrimaryClipboard(),
+        };
+    }
+
+    /// Set the clipboard contents.
+    pub fn set(
+        self: *Surface,
+        val: [:0]const u8,
+        clipboard_type: apprt.Clipboard,
+        confirm: bool,
+    ) void {
+        const priv = self.private();
+
+        // If no confirmation is necessary, set the clipboard.
+        if (!confirm) {
+            const clipboard = get(
+                priv.gl_area.as(gtk.Widget),
+                clipboard_type,
+            ) orelse return;
+            clipboard.setText(val);
+
+            Surface.signals.@"clipboard-write".impl.emit(
+                self,
+                null,
+                .{},
+                null,
+            );
+
+            return;
+        }
+
+        showClipboardConfirmation(
+            self,
+            .{ .osc_52_write = clipboard_type },
+            val,
+        );
+    }
+
+    /// Request data from the clipboard (read the clipboard). This
+    /// completes asynchronously and will call the `completeClipboardRequest`
+    /// core surface API when done.
+    pub fn request(
+        self: *Surface,
+        clipboard_type: apprt.Clipboard,
+        state: apprt.ClipboardRequest,
+    ) Allocator.Error!void {
+        // Get our requested clipboard
+        const clipboard = get(
+            self.private().gl_area.as(gtk.Widget),
+            clipboard_type,
+        ) orelse return;
+
+        // Allocate our userdata
+        const alloc = Application.default().allocator();
+        const ud = try alloc.create(Request);
+        errdefer alloc.destroy(ud);
+        ud.* = .{
+            // Important: we ref self here so that we can't free memory
+            // while we have an outstanding clipboard read.
+            .self = self.ref(),
+            .state = state,
+        };
+        errdefer self.unref();
+
+        // Read
+        clipboard.readTextAsync(
+            null,
+            clipboardReadText,
+            ud,
+        );
+    }
+
+    fn showClipboardConfirmation(
+        self: *Surface,
+        req: apprt.ClipboardRequest,
+        str: [:0]const u8,
+    ) void {
+        // Build a text buffer for our contents
+        const contents_buf: *gtk.TextBuffer = .new(null);
+        defer contents_buf.unref();
+        contents_buf.insertAtCursor(str, @intCast(str.len));
+
+        // Confirm
+        const dialog = gobject.ext.newInstance(
+            ClipboardConfirmationDialog,
+            .{
+                .request = &req,
+                .@"can-remember" = switch (req) {
+                    .osc_52_read, .osc_52_write => true,
+                    .paste => false,
+                },
+                .@"clipboard-contents" = contents_buf,
+            },
+        );
+
+        _ = ClipboardConfirmationDialog.signals.confirm.connect(
+            dialog,
+            *Surface,
+            clipboardConfirmationConfirm,
+            self,
+            .{},
+        );
+        _ = ClipboardConfirmationDialog.signals.deny.connect(
+            dialog,
+            *Surface,
+            clipboardConfirmationDeny,
+            self,
+            .{},
+        );
+
+        dialog.present(self.as(gtk.Widget));
+    }
+
+    fn clipboardConfirmationConfirm(
+        dialog: *ClipboardConfirmationDialog,
+        remember: bool,
+        self: *Surface,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+        const req = dialog.getRequest() orelse return;
+
+        // Handle remember
+        if (remember) switch (req.*) {
+            .osc_52_read => surface.config.clipboard_read = .allow,
+            .osc_52_write => surface.config.clipboard_write = .allow,
+            .paste => {},
+        };
+
+        // Get our text
+        const text_buf = dialog.getClipboardContents() orelse return;
+        var text_val = gobject.ext.Value.new(?[:0]const u8);
+        defer text_val.unset();
+        gobject.Object.getProperty(
+            text_buf.as(gobject.Object),
+            "text",
+            &text_val,
+        );
+        const text = gobject.ext.Value.get(
+            &text_val,
+            ?[:0]const u8,
+        ) orelse return;
+
+        surface.completeClipboardRequest(
+            req.*,
+            text,
+            true,
+        ) catch |err| {
+            log.warn("failed to complete clipboard request: {}", .{err});
+        };
+    }
+
+    fn clipboardConfirmationDeny(
+        dialog: *ClipboardConfirmationDialog,
+        remember: bool,
+        self: *Surface,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const surface = priv.core_surface orelse return;
+        const req = dialog.getRequest() orelse return;
+
+        // Handle remember
+        if (remember) switch (req.*) {
+            .osc_52_read => surface.config.clipboard_read = .deny,
+            .osc_52_write => surface.config.clipboard_write = .deny,
+            .paste => @panic("paste should not be able to be remembered"),
+        };
+    }
+
+    fn clipboardReadText(
+        source: ?*gobject.Object,
+        res: *gio.AsyncResult,
+        ud: ?*anyopaque,
+    ) callconv(.c) void {
+        const clipboard = gobject.ext.cast(
+            gdk.Clipboard,
+            source orelse return,
+        ) orelse return;
+        const req: *Request = @ptrCast(@alignCast(ud orelse return));
+
+        const alloc = Application.default().allocator();
+        defer alloc.destroy(req);
+
+        const self = req.self;
+        defer self.unref();
+
+        var gerr: ?*glib.Error = null;
+        const cstr_ = clipboard.readTextFinish(res, &gerr);
+        if (gerr) |err| {
+            defer err.free();
+            log.warn(
+                "failed to read clipboard err={s}",
+                .{err.f_message orelse "(no message)"},
+            );
+            return;
+        }
+        const cstr = cstr_ orelse return;
+        defer glib.free(cstr);
+        const str = std.mem.sliceTo(cstr, 0);
+
+        const surface = self.private().core_surface orelse return;
+        surface.completeClipboardRequest(
+            req.state,
+            str,
+            false,
+        ) catch |err| switch (err) {
+            error.UnsafePaste,
+            error.UnauthorizedPaste,
+            => {
+                showClipboardConfirmation(
+                    self,
+                    req.state,
+                    str,
+                );
+                return;
+            },
+
+            else => {
+                log.warn(
+                    "failed to complete clipboard request err={}",
+                    .{err},
+                );
+                return;
+            },
+        };
+
+        Surface.signals.@"clipboard-read".impl.emit(
+            self,
+            null,
+            .{},
+            null,
+        );
+    }
+
+    /// The request we send as userdata to the clipboard read.
+    const Request = struct {
+        /// "Self" is reffed so we can't dispose it until the clipboard
+        /// read is complete. Callers must unref when done.
+        self: *Surface,
+        state: apprt.ClipboardRequest,
+    };
+};

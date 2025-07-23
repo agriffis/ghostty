@@ -12,10 +12,13 @@ pub fn build(b: *std.Build) !void {
         .optimize = optimize,
     });
 
-    const lib = b.addStaticLibrary(.{
+    const lib = b.addLibrary(.{
         .name = "macos",
-        .target = target,
-        .optimize = optimize,
+        .root_module = b.createModule(.{
+            .target = target,
+            .optimize = optimize,
+        }),
+        .linkage = .static,
     });
 
     lib.addCSourceFile(.{
@@ -51,9 +54,11 @@ pub fn build(b: *std.Build) !void {
     {
         const test_exe = b.addTest(.{
             .name = "test",
-            .root_source_file = b.path("main.zig"),
-            .target = target,
-            .optimize = optimize,
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("main.zig"),
+                .target = target,
+                .optimize = optimize,
+            }),
         });
         if (target.result.os.tag.isDarwin()) {
             try apple_sdk.addPaths(b, test_exe);

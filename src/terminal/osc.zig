@@ -800,6 +800,9 @@ pub const Parser = struct {
                     self.temp_state = .{ .str = &self.command.clipboard_contents.data };
                     self.buf_start = self.buf_idx;
                     self.prepAllocableString();
+
+                    // See clipboard_kind_end
+                    self.complete = true;
                 },
                 else => {
                     self.command.clipboard_contents.kind = c;
@@ -812,6 +815,11 @@ pub const Parser = struct {
                     self.temp_state = .{ .str = &self.command.clipboard_contents.data };
                     self.buf_start = self.buf_idx;
                     self.prepAllocableString();
+
+                    // OSC 52 can have empty payloads (quoting xterm ctlseqs):
+                    // "If the second parameter is neither a base64 string nor ?,
+                    // then the selection is cleared."
+                    self.complete = true;
                 },
                 else => self.state = .invalid,
             },
@@ -1896,7 +1904,7 @@ test "OSC: get/set clipboard" {
     const cmd = p.end(null).?;
     try testing.expect(cmd == .clipboard_contents);
     try testing.expect(cmd.clipboard_contents.kind == 's');
-    try testing.expect(std.mem.eql(u8, "?", cmd.clipboard_contents.data));
+    try testing.expectEqualStrings("?", cmd.clipboard_contents.data);
 }
 
 test "OSC: get/set clipboard (optional parameter)" {
@@ -1910,7 +1918,7 @@ test "OSC: get/set clipboard (optional parameter)" {
     const cmd = p.end(null).?;
     try testing.expect(cmd == .clipboard_contents);
     try testing.expect(cmd.clipboard_contents.kind == 'c');
-    try testing.expect(std.mem.eql(u8, "?", cmd.clipboard_contents.data));
+    try testing.expectEqualStrings("?", cmd.clipboard_contents.data);
 }
 
 test "OSC: get/set clipboard with allocator" {
@@ -1925,7 +1933,22 @@ test "OSC: get/set clipboard with allocator" {
     const cmd = p.end(null).?;
     try testing.expect(cmd == .clipboard_contents);
     try testing.expect(cmd.clipboard_contents.kind == 's');
-    try testing.expect(std.mem.eql(u8, "?", cmd.clipboard_contents.data));
+    try testing.expectEqualStrings("?", cmd.clipboard_contents.data);
+}
+
+test "OSC: clear clipboard" {
+    const testing = std.testing;
+
+    var p: Parser = .{ .alloc = testing.allocator };
+    defer p.deinit();
+
+    const input = "52;;";
+    for (input) |ch| p.next(ch);
+
+    const cmd = p.end(null).?;
+    try testing.expect(cmd == .clipboard_contents);
+    try testing.expect(cmd.clipboard_contents.kind == 'c');
+    try testing.expectEqualStrings("", cmd.clipboard_contents.data);
 }
 
 test "OSC: report pwd" {
@@ -1938,7 +1961,7 @@ test "OSC: report pwd" {
 
     const cmd = p.end(null).?;
     try testing.expect(cmd == .report_pwd);
-    try testing.expect(std.mem.eql(u8, "file:///tmp/example", cmd.report_pwd.value));
+    try testing.expectEqualStrings("file:///tmp/example", cmd.report_pwd.value);
 }
 
 test "OSC: report pwd empty" {
@@ -1950,7 +1973,7 @@ test "OSC: report pwd empty" {
     for (input) |ch| p.next(ch);
     const cmd = p.end(null).?;
     try testing.expect(cmd == .report_pwd);
-    try testing.expect(std.mem.eql(u8, "", cmd.report_pwd.value));
+    try testing.expectEqualStrings("", cmd.report_pwd.value);
 }
 
 test "OSC: pointer cursor" {
@@ -1963,7 +1986,7 @@ test "OSC: pointer cursor" {
 
     const cmd = p.end(null).?;
     try testing.expect(cmd == .mouse_shape);
-    try testing.expect(std.mem.eql(u8, "pointer", cmd.mouse_shape.value));
+    try testing.expectEqualStrings("pointer", cmd.mouse_shape.value);
 }
 
 test "OSC: longer than buffer" {
