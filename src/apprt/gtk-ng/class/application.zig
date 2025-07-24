@@ -481,9 +481,13 @@ pub const Application = extern struct {
 
             .quit_timer => try Action.quitTimer(self, value),
 
+            .progress_report => return Action.progressReport(target, value),
+
             .render => Action.render(self, target),
 
             .set_title => Action.setTitle(target, value),
+
+            .show_child_exited => return Action.showChildExited(target, value),
 
             .show_gtk_inspector => Action.showGtkInspector(),
 
@@ -514,7 +518,6 @@ pub const Application = extern struct {
             .ring_bell,
             .toggle_command_palette,
             .open_url,
-            .show_child_exited,
             .close_all_windows,
             .float_window,
             .toggle_visibility,
@@ -527,7 +530,6 @@ pub const Application = extern struct {
             .check_for_updates,
             .undo,
             .redo,
-            .progress_report,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
@@ -1116,6 +1118,19 @@ const Action = struct {
         }
     }
 
+    pub fn progressReport(
+        target: apprt.Target,
+        value: terminal.osc.Command.ProgressReport,
+    ) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| surface: {
+                v.rt_surface.surface.setProgressReport(value);
+                break :surface true;
+            },
+        };
+    }
+
     pub fn render(_: *Application, target: apprt.Target) void {
         switch (target) {
             .app => {},
@@ -1139,6 +1154,16 @@ const Action = struct {
                 );
             },
         }
+    }
+
+    pub fn showChildExited(
+        target: apprt.Target,
+        value: apprt.surface.Message.ChildExited,
+    ) bool {
+        return switch (target) {
+            .app => false,
+            .surface => |v| v.rt_surface.surface.childExited(value),
+        };
     }
 
     pub fn showGtkInspector() void {

@@ -1,4 +1,5 @@
 const std = @import("std");
+const assert = std.debug.assert;
 const Allocator = std.mem.Allocator;
 const adw = @import("adw");
 const gdk = @import("gdk");
@@ -21,6 +22,7 @@ const Common = @import("../class.zig").Common;
 const Application = @import("application.zig").Application;
 const Config = @import("config.zig").Config;
 const ResizeOverlay = @import("resize_overlay.zig").ResizeOverlay;
+const ChildExited = @import("surface_child_exited.zig").SurfaceChildExited;
 const ClipboardConfirmationDialog = @import("clipboard_confirmation_dialog.zig").ClipboardConfirmationDialog;
 
 const log = std.log.scoped(.gtk_ghostty_surface);
@@ -52,6 +54,26 @@ pub const Surface = extern struct {
                         Private,
                         &Private.offset,
                         "config",
+                    ),
+                },
+            );
+        };
+
+        pub const @"child-exited" = struct {
+            pub const name = "child-exited";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .nick = "Child Exited",
+                    .blurb = "True when the child process has exited.",
+                    .default = false,
+                    .accessor = gobject.ext.privateFieldAccessor(
+                        Self,
+                        Private,
+                        &Private.offset,
+                        "child_exited",
                     ),
                 },
             );
@@ -245,10 +267,6 @@ pub const Surface = extern struct {
         /// focus events.
         focused: bool = true,
 
-        /// The overlay we use for things such as the URL hover label
-        /// or resize box. Bound from the template.
-        overlay: *gtk.Overlay,
-
         /// The GLAarea that renders the actual surface. This is a binding
         /// to the template so it doesn't have to be unrefed manually.
         gl_area: *gtk.GLArea,
@@ -256,17 +274,9 @@ pub const Surface = extern struct {
         /// The labels for the left/right sides of the URL hover tooltip.
         url_left: *gtk.Label,
         url_right: *gtk.Label,
-        url_ec_motion: *gtk.EventControllerMotion,
 
         /// The resize overlay
         resize_overlay: *ResizeOverlay,
-
-        // Event controllers
-        ec_focus: *gtk.EventControllerFocus,
-        ec_key: *gtk.EventControllerKey,
-        ec_motion: *gtk.EventControllerMotion,
-        ec_scroll: *gtk.EventControllerScroll,
-        gesture_click: *gtk.GestureClick,
 
         /// The apprt Surface.
         rt_surface: ApprtSurface = undefined,
@@ -288,13 +298,24 @@ pub const Surface = extern struct {
 
         /// Various input method state. All related to key input.
         in_keyevent: IMKeyEvent = .false,
-        im_context: ?*gtk.IMMulticontext = null,
+        im_context: *gtk.IMMulticontext,
         im_composing: bool = false,
         im_buf: [128]u8 = undefined,
         im_len: u7 = 0,
 
         /// True when we have a precision scroll in progress
         precision_scroll: bool = false,
+
+        /// True when the child has exited.
+        child_exited: bool = false,
+
+        // Progress bar
+        progress_bar_timer: ?c_uint = null,
+
+        // Template binds
+        child_exited_overlay: *ChildExited,
+        drop_target: *gtk.DropTarget,
+        progress_bar_overlay: *gtk.ProgressBar,
 
         pub var offset: c_int = 0;
     };
@@ -320,6 +341,93 @@ pub const Surface = extern struct {
     pub fn redraw(self: *Self) void {
         const priv = self.private();
         priv.gl_area.queueRender();
+    }
+
+    /// Set the current progress report state.
+    pub fn setProgressReport(
+        self: *Self,
+        value: terminal.osc.Command.ProgressReport,
+    ) void {
+        const priv = self.private();
+
+        // No matter what, we stop the timer because if we're removing
+        // then we're done and otherwise we restart it.
+        if (priv.progress_bar_timer) |timer| {
+            if (glib.Source.remove(timer) == 0) {
+                log.warn("unable to remove progress bar timer", .{});
+            }
+            priv.progress_bar_timer = null;
+        }
+
+        const progress_bar = priv.progress_bar_overlay;
+        switch (value.state) {
+            // Remove the progress bar
+            .remove => {
+                progress_bar.as(gtk.Widget).setVisible(@intFromBool(false));
+                return;
+            },
+
+            // Set the progress bar to a fixed value if one was provided, otherwise pulse.
+            // Remove the `error` CSS class so that the progress bar shows as normal.
+            .set => {
+                progress_bar.as(gtk.Widget).removeCssClass("error");
+                if (value.progress) |progress| {
+                    progress_bar.setFraction(computeFraction(progress));
+                } else {
+                    progress_bar.pulse();
+                }
+            },
+
+            // Set the progress bar to a fixed value if one was provided, otherwise pulse.
+            // Set the `error` CSS class so that the progress bar shows as an error color.
+            .@"error" => {
+                progress_bar.as(gtk.Widget).addCssClass("error");
+                if (value.progress) |progress| {
+                    progress_bar.setFraction(computeFraction(progress));
+                } else {
+                    progress_bar.pulse();
+                }
+            },
+
+            // The state of progress is unknown, so pulse the progress bar to
+            // indicate that things are still happening.
+            .indeterminate => {
+                progress_bar.pulse();
+            },
+
+            // If a progress value was provided, set the progress bar to that value.
+            // Don't pulse the progress bar as that would indicate that things were
+            // happening. Otherwise this is mainly used to keep the progress bar on
+            // screen instead of timing out.
+            .pause => {
+                if (value.progress) |progress| {
+                    progress_bar.setFraction(computeFraction(progress));
+                }
+            },
+        }
+
+        // Assume all states lead to visibility
+        assert(value.state != .remove);
+        progress_bar.as(gtk.Widget).setVisible(@intFromBool(true));
+
+        // Start our timer to remove bad actor programs that stall
+        // the progress bar.
+        const progress_bar_timeout_seconds = 15;
+        assert(priv.progress_bar_timer == null);
+        priv.progress_bar_timer = glib.timeoutAdd(
+            progress_bar_timeout_seconds * std.time.ms_per_s,
+            progressBarTimer,
+            self,
+        );
+    }
+
+    /// The progress bar hasn't been updated by the TUI recently, remove it.
+    fn progressBarTimer(ud: ?*anyopaque) callconv(.c) c_int {
+        const self: *Self = @ptrCast(@alignCast(ud.?));
+        const priv = self.private();
+        priv.progress_bar_timer = null;
+        self.setProgressReport(.{ .state = .remove });
+        return @intFromBool(glib.SOURCE_REMOVE);
     }
 
     /// Key press event (press or release).
@@ -368,13 +476,13 @@ pub const Surface = extern struct {
         // The block below is all related to input method handling. See the function
         // comment for some high level details and then the comments within
         // the block for more specifics.
-        if (priv.im_context) |im_context| {
+        {
             // This can trigger an input method so we need to notify the im context
             // where the cursor is so it can render the dropdowns in the correct
             // place.
             if (priv.core_surface) |surface| {
                 const ime_point = surface.imePoint();
-                im_context.as(gtk.IMContext).setCursorLocation(&.{
+                priv.im_context.as(gtk.IMContext).setCursorLocation(&.{
                     .f_x = @intFromFloat(ime_point.x),
                     .f_y = @intFromFloat(ime_point.y),
                     .f_width = 1,
@@ -415,7 +523,7 @@ pub const Surface = extern struct {
             //   triggered despite being technically consumed. At the time of
             //   writing, both Kitty and Alacritty have the same behavior. I
             //   know of no way to fix this.
-            const im_handled = im_context.as(gtk.IMContext).filterKeypress(event) != 0;
+            const im_handled = priv.im_context.as(gtk.IMContext).filterKeypress(event) != 0;
             // log.warn("GTKIM: im_handled={} im_len={} im_composing={}", .{
             //     im_handled,
             //     self.im_len,
@@ -546,10 +654,7 @@ pub const Surface = extern struct {
                 // because there is other IME state that we want to preserve,
                 // such as quotation mark ordering for Chinese input.
                 if (priv.im_composing) {
-                    if (priv.im_context) |im_context| {
-                        im_context.as(gtk.IMContext).reset();
-                    }
-
+                    priv.im_context.as(gtk.IMContext).reset();
                     surface.preeditCallback(null) catch {};
                 }
 
@@ -644,6 +749,29 @@ pub const Surface = extern struct {
             .{process_active},
             null,
         );
+    }
+
+    pub fn childExited(
+        self: *Self,
+        data: apprt.surface.Message.ChildExited,
+    ) bool {
+        // Even if we don't support the overlay, we still keep our property
+        // up to date for anyone listening.
+        const priv = self.private();
+        priv.child_exited = true;
+        self.as(gobject.Object).notifyByPspec(
+            properties.@"child-exited".impl.param_spec,
+        );
+
+        // If we have the noop child exited overlay then we don't do anything
+        // for child exited. The false return will force libghostty to show
+        // the normal text-based message.
+        if (comptime @hasDecl(ChildExited, "noop")) {
+            return false;
+        }
+
+        priv.child_exited_overlay.setData(&data);
+        return true;
     }
 
     pub fn cgroupPath(self: *Self) ?[]const u8 {
@@ -803,226 +931,32 @@ pub const Surface = extern struct {
             priv.config = app.getConfig();
         }
 
-        // Setup our event controllers to get input events
-        _ = gtk.EventControllerKey.signals.key_pressed.connect(
-            priv.ec_key,
-            *Self,
-            ecKeyPressed,
-            self,
-            .{},
-        );
-        _ = gtk.EventControllerKey.signals.key_released.connect(
-            priv.ec_key,
-            *Self,
-            ecKeyReleased,
-            self,
-            .{},
-        );
-
-        // Focus controller will tell us about focus enter/exit events
-        _ = gtk.EventControllerFocus.signals.enter.connect(
-            priv.ec_focus,
-            *Self,
-            ecFocusEnter,
-            self,
-            .{},
-        );
-        _ = gtk.EventControllerFocus.signals.leave.connect(
-            priv.ec_focus,
-            *Self,
-            ecFocusLeave,
-            self,
-            .{},
-        );
-
-        // Clicks
-        _ = gtk.GestureClick.signals.pressed.connect(
-            priv.gesture_click,
-            *Self,
-            gcMouseDown,
-            self,
-            .{},
-        );
-        _ = gtk.GestureClick.signals.released.connect(
-            priv.gesture_click,
-            *Self,
-            gcMouseUp,
-            self,
-            .{},
-        );
-
-        // Mouse movement
-        _ = gtk.EventControllerMotion.signals.motion.connect(
-            priv.ec_motion,
-            *Self,
-            ecMouseMotion,
-            self,
-            .{},
-        );
-        _ = gtk.EventControllerMotion.signals.leave.connect(
-            priv.ec_motion,
-            *Self,
-            ecMouseLeave,
-            self,
-            .{},
-        );
-
-        // Scroll
-        _ = gtk.EventControllerScroll.signals.scroll.connect(
-            priv.ec_scroll,
-            *Self,
-            ecMouseScroll,
-            self,
-            .{},
-        );
-        _ = gtk.EventControllerScroll.signals.scroll_begin.connect(
-            priv.ec_scroll,
-            *Self,
-            ecMouseScrollPrecisionBegin,
-            self,
-            .{},
-        );
-        _ = gtk.EventControllerScroll.signals.scroll_end.connect(
-            priv.ec_scroll,
-            *Self,
-            ecMouseScrollPrecisionEnd,
-            self,
-            .{},
-        );
-
         // Setup our input method state
-        const im_context = gtk.IMMulticontext.new();
-        priv.im_context = im_context;
         priv.in_keyevent = .false;
         priv.im_composing = false;
         priv.im_len = 0;
-        _ = gtk.IMContext.signals.preedit_start.connect(
-            im_context,
-            *Self,
-            imPreeditStart,
-            self,
-            .{},
-        );
-        _ = gtk.IMContext.signals.preedit_changed.connect(
-            im_context,
-            *Self,
-            imPreeditChanged,
-            self,
-            .{},
-        );
-        _ = gtk.IMContext.signals.preedit_end.connect(
-            im_context,
-            *Self,
-            imPreeditEnd,
-            self,
-            .{},
-        );
-        _ = gtk.IMContext.signals.commit.connect(
-            im_context,
-            *Self,
-            imCommit,
-            self,
-            .{},
-        );
 
-        // Initialize our GLArea. We could do a lot of this in
-        // the Blueprint file but I think its cleaner to separate
-        // the "UI" part of the blueprint file from the internal logic/config
-        // part.
+        // Set up to handle items being dropped on our surface. Files can be dropped
+        // from Nautilus and strings can be dropped from many programs. The order
+        // of these types matter.
+        var drop_target_types = [_]gobject.Type{
+            gdk.FileList.getGObjectType(),
+            gio.File.getGObjectType(),
+            gobject.ext.types.string,
+        };
+        priv.drop_target.setGtypes(&drop_target_types, drop_target_types.len);
+
+        // Initialize our GLArea. We only set the values we can't set
+        // in our blueprint file.
         const gl_area = priv.gl_area;
         gl_area.setRequiredVersion(
             renderer.OpenGL.MIN_VERSION_MAJOR,
             renderer.OpenGL.MIN_VERSION_MINOR,
         );
-        gl_area.setHasStencilBuffer(0);
-        gl_area.setHasDepthBuffer(0);
-        gl_area.setUseEs(0);
         gl_area.as(gtk.Widget).setCursorFromName("text");
-        _ = gtk.Widget.signals.realize.connect(
-            gl_area,
-            *Self,
-            glareaRealize,
-            self,
-            .{},
-        );
-        _ = gtk.Widget.signals.unrealize.connect(
-            gl_area,
-            *Self,
-            glareaUnrealize,
-            self,
-            .{},
-        );
-        _ = gtk.GLArea.signals.render.connect(
-            gl_area,
-            *Self,
-            glareaRender,
-            self,
-            .{},
-        );
-        _ = gtk.GLArea.signals.resize.connect(
-            gl_area,
-            *Self,
-            glareaResize,
-            self,
-            .{},
-        );
-
-        // Some property signals
-        _ = gobject.Object.signals.notify.connect(
-            self,
-            ?*anyopaque,
-            &propConfig,
-            null,
-            .{ .detail = "config" },
-        );
-        _ = gobject.Object.signals.notify.connect(
-            self,
-            ?*anyopaque,
-            &propMouseHoverUrl,
-            null,
-            .{ .detail = "mouse-hover-url" },
-        );
-        _ = gobject.Object.signals.notify.connect(
-            self,
-            ?*anyopaque,
-            &propMouseHidden,
-            null,
-            .{ .detail = "mouse-hidden" },
-        );
-        _ = gobject.Object.signals.notify.connect(
-            self,
-            ?*anyopaque,
-            &propMouseShape,
-            null,
-            .{ .detail = "mouse-shape" },
-        );
-
-        // Some other initialization steps
-        self.initUrlOverlay();
 
         // Initialize our config
         self.propConfig(undefined, null);
-    }
-
-    fn initUrlOverlay(self: *Self) void {
-        const priv = self.private();
-
-        // Setup a motion controller to handle moving the label
-        // to avoid the mouse.
-        _ = gtk.EventControllerMotion.signals.enter.connect(
-            priv.url_ec_motion,
-            *Self,
-            ecUrlMouseEnter,
-            self,
-            .{},
-        );
-        _ = gtk.EventControllerMotion.signals.leave.connect(
-            priv.url_ec_motion,
-            *Self,
-            ecUrlMouseLeave,
-            self,
-            .{},
-        );
     }
 
     fn dispose(self: *Self) callconv(.C) void {
@@ -1031,9 +965,11 @@ pub const Surface = extern struct {
             v.unref();
             priv.config = null;
         }
-        if (priv.im_context) |v| {
-            v.unref();
-            priv.im_context = null;
+        if (priv.progress_bar_timer) |timer| {
+            if (glib.Source.remove(timer) == 0) {
+                log.warn("unable to remove progress bar timer", .{});
+            }
+            priv.progress_bar_timer = null;
         }
 
         gtk.Widget.disposeTemplate(
@@ -1225,6 +1161,108 @@ pub const Surface = extern struct {
     //---------------------------------------------------------------
     // Signal Handlers
 
+    fn childExitedClose(
+        _: *ChildExited,
+        self: *Self,
+    ) callconv(.c) void {
+        // This closes the surface with no confirmation.
+        self.close(false);
+    }
+
+    fn dtDrop(
+        _: *gtk.DropTarget,
+        value: *gobject.Value,
+        _: f64,
+        _: f64,
+        self: *Self,
+    ) callconv(.c) c_int {
+        const alloc = Application.default().allocator();
+
+        if (g_value_holds(
+            value,
+            gdk.FileList.getGObjectType(),
+        )) {
+            var data = std.ArrayList(u8).init(alloc);
+            defer data.deinit();
+
+            var shell_escape_writer: internal_os.ShellEscapeWriter(std.ArrayList(u8).Writer) = .{
+                .child_writer = data.writer(),
+            };
+            const writer = shell_escape_writer.writer();
+
+            const list: ?*glib.SList = list: {
+                const unboxed = value.getBoxed() orelse return 0;
+                const fl: *gdk.FileList = @ptrCast(@alignCast(unboxed));
+                break :list fl.getFiles();
+            };
+            defer if (list) |v| v.free();
+
+            {
+                var current: ?*glib.SList = list;
+                while (current) |item| : (current = item.f_next) {
+                    const file: *gio.File = @ptrCast(@alignCast(item.f_data orelse continue));
+                    const path = file.getPath() orelse continue;
+                    const slice = std.mem.span(path);
+                    defer glib.free(path);
+
+                    writer.writeAll(slice) catch |err| {
+                        log.err("unable to write path to buffer: {}", .{err});
+                        continue;
+                    };
+                    writer.writeAll("\n") catch |err| {
+                        log.err("unable to write to buffer: {}", .{err});
+                        continue;
+                    };
+                }
+            }
+
+            const string = data.toOwnedSliceSentinel(0) catch |err| {
+                log.err("unable to convert to a slice: {}", .{err});
+                return 0;
+            };
+            defer alloc.free(string);
+            Clipboard.paste(self, string);
+            return 1;
+        }
+
+        if (g_value_holds(value, gio.File.getGObjectType())) {
+            const object = value.getObject() orelse return 0;
+            const file = gobject.ext.cast(gio.File, object) orelse return 0;
+            const path = file.getPath() orelse return 0;
+            var data = std.ArrayList(u8).init(alloc);
+            defer data.deinit();
+
+            var shell_escape_writer: internal_os.ShellEscapeWriter(std.ArrayList(u8).Writer) = .{
+                .child_writer = data.writer(),
+            };
+            const writer = shell_escape_writer.writer();
+            writer.writeAll(std.mem.span(path)) catch |err| {
+                log.err("unable to write path to buffer: {}", .{err});
+                return 0;
+            };
+            writer.writeAll("\n") catch |err| {
+                log.err("unable to write to buffer: {}", .{err});
+                return 0;
+            };
+
+            const string = data.toOwnedSliceSentinel(0) catch |err| {
+                log.err("unable to convert to a slice: {}", .{err});
+                return 0;
+            };
+            defer alloc.free(string);
+            return 1;
+        }
+
+        if (g_value_holds(value, gobject.ext.types.string)) {
+            if (value.getString()) |string| {
+                Clipboard.paste(self, std.mem.span(string));
+            }
+            return 1;
+        }
+
+        return 1;
+    }
+
     fn ecKeyPressed(
         ec_key: *gtk.EventControllerKey,
         keyval: c_uint,
@@ -1260,22 +1298,14 @@ pub const Surface = extern struct {
     fn ecFocusEnter(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.focused = true;
-
-        if (priv.im_context) |im_context| {
-            im_context.as(gtk.IMContext).focusIn();
-        }
-
+        priv.im_context.as(gtk.IMContext).focusIn();
         _ = glib.idleAddOnce(idleFocus, self.ref());
     }
 
     fn ecFocusLeave(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
         const priv = self.private();
         priv.focused = false;
-
-        if (priv.im_context) |im_context| {
-            im_context.as(gtk.IMContext).focusOut();
-        }
-
+        priv.im_context.as(gtk.IMContext).focusOut();
         _ = glib.idleAddOnce(idleFocus, self.ref());
     }
 
@@ -1647,9 +1677,8 @@ pub const Surface = extern struct {
         // Setup our input method. We do this here because this will
         // create a strong reference back to ourself and we want to be
         // able to release that in unrealize.
-        if (self.private().im_context) |im_context| {
-            im_context.as(gtk.IMContext).setClientWidget(self.as(gtk.Widget));
-        }
+        const priv = self.private();
+        priv.im_context.as(gtk.IMContext).setClientWidget(self.as(gtk.Widget));
     }
 
     fn glareaUnrealize(
@@ -1683,9 +1712,7 @@ pub const Surface = extern struct {
         }
 
         // Unset our input method
-        if (priv.im_context) |im_context| {
-            im_context.as(gtk.IMContext).setClientWidget(null);
-        }
+        priv.im_context.as(gtk.IMContext).setClientWidget(null);
     }
 
     fn glareaRender(
@@ -1889,6 +1916,7 @@ pub const Surface = extern struct {
 
         fn init(class: *Class) callconv(.C) void {
             gobject.ext.ensureType(ResizeOverlay);
+            gobject.ext.ensureType(ChildExited);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
@@ -1899,33 +1927,48 @@ pub const Surface = extern struct {
             );
 
             // Bindings
-            class.bindTemplateChildPrivate("overlay", .{});
             class.bindTemplateChildPrivate("gl_area", .{});
             class.bindTemplateChildPrivate("url_left", .{});
             class.bindTemplateChildPrivate("url_right", .{});
+            class.bindTemplateChildPrivate("child_exited_overlay", .{});
+            class.bindTemplateChildPrivate("progress_bar_overlay", .{});
             class.bindTemplateChildPrivate("resize_overlay", .{});
+            class.bindTemplateChildPrivate("drop_target", .{});
+            class.bindTemplateChildPrivate("im_context", .{});
 
-            // EventControllers don't work with our helper.
-            // https://github.com/ianprime0509/zig-gobject/issues/111
-            inline for (&.{
-                "ec_focus",
-                "ec_key",
-                "ec_motion",
-                "ec_scroll",
-                "gesture_click",
-                "url_ec_motion",
-            }) |name| {
-                gtk.Widget.Class.bindTemplateChildFull(
-                    gobject.ext.as(gtk.Widget.Class, class),
-                    name,
-                    @intFromBool(false),
-                    Private.offset + @offsetOf(Private, name),
-                );
-            }
+            // Template Callbacks
+            class.bindTemplateCallback("focus_enter", &ecFocusEnter);
+            class.bindTemplateCallback("focus_leave", &ecFocusLeave);
+            class.bindTemplateCallback("key_pressed", &ecKeyPressed);
+            class.bindTemplateCallback("key_released", &ecKeyReleased);
+            class.bindTemplateCallback("mouse_down", &gcMouseDown);
+            class.bindTemplateCallback("mouse_up", &gcMouseUp);
+            class.bindTemplateCallback("mouse_motion", &ecMouseMotion);
+            class.bindTemplateCallback("mouse_leave", &ecMouseLeave);
+            class.bindTemplateCallback("scroll", &ecMouseScroll);
+            class.bindTemplateCallback("scroll_begin", &ecMouseScrollPrecisionBegin);
+            class.bindTemplateCallback("scroll_end", &ecMouseScrollPrecisionEnd);
+            class.bindTemplateCallback("drop", &dtDrop);
+            class.bindTemplateCallback("gl_realize", &glareaRealize);
+            class.bindTemplateCallback("gl_unrealize", &glareaUnrealize);
+            class.bindTemplateCallback("gl_render", &glareaRender);
+            class.bindTemplateCallback("gl_resize", &glareaResize);
+            class.bindTemplateCallback("im_preedit_start", &imPreeditStart);
+            class.bindTemplateCallback("im_preedit_changed", &imPreeditChanged);
+            class.bindTemplateCallback("im_preedit_end", &imPreeditEnd);
+            class.bindTemplateCallback("im_commit", &imCommit);
+            class.bindTemplateCallback("url_mouse_enter", &ecUrlMouseEnter);
+            class.bindTemplateCallback("url_mouse_leave", &ecUrlMouseLeave);
+            class.bindTemplateCallback("child_exited_close", &childExitedClose);
+            class.bindTemplateCallback("notify_config", &propConfig);
+            class.bindTemplateCallback("notify_mouse_hover_url", &propMouseHoverUrl);
+            class.bindTemplateCallback("notify_mouse_hidden", &propMouseHidden);
+            class.bindTemplateCallback("notify_mouse_shape", &propMouseShape);
 
             // Properties
             gobject.ext.registerProperties(class, &.{
                 properties.config.impl,
+                properties.@"child-exited".impl,
                 properties.focused.impl,
                 properties.@"mouse-shape".impl,
                 properties.@"mouse-hidden".impl,
@@ -1946,6 +1989,7 @@ pub const Surface = extern struct {
 
         pub const as = C.Class.as;
         pub const bindTemplateChildPrivate = C.Class.bindTemplateChildPrivate;
+        pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 };
 
@@ -1982,17 +2026,6 @@ fn translateMouseButton(button: c_uint) input.MouseButton {
 
 /// A namespace for our clipboard-related functions so Surface isn't SO large.
 const Clipboard = struct {
-    /// Get the specific type of clipboard for a widget.
-    pub fn get(
-        widget: *gtk.Widget,
-        clipboard: apprt.Clipboard,
-    ) ?*gdk.Clipboard {
-        return switch (clipboard) {
-            .standard => widget.getClipboard(),
-            .selection, .primary => widget.getPrimaryClipboard(),
-        };
-    }
-
     /// Set the clipboard contents.
     pub fn set(
         self: *Surface,
@@ -2059,6 +2092,52 @@ const Clipboard = struct {
             clipboardReadText,
             ud,
         );
+    }
+
+    /// Paste explicit text directly into the surface, regardless of the
+    /// actual clipboard contents.
+    pub fn paste(
+        self: *Surface,
+        text: [:0]const u8,
+    ) void {
+        if (text.len == 0) return;
+
+        const surface = self.private().core_surface orelse return;
+        surface.completeClipboardRequest(
+            .paste,
+            text,
+            false,
+        ) catch |err| switch (err) {
+            error.UnsafePaste,
+            error.UnauthorizedPaste,
+            => {
+                showClipboardConfirmation(
+                    self,
+                    .paste,
+                    text,
+                );
+                return;
+            },
+
+            else => {
+                log.warn(
+                    "failed to complete clipboard request err={}",
+                    .{err},
+                );
+                return;
+            },
+        };
+    }
+
+    /// Get the specific type of clipboard for a widget.
+    fn get(
+        widget: *gtk.Widget,
+        clipboard: apprt.Clipboard,
+    ) ?*gdk.Clipboard {
+        return switch (clipboard) {
+            .standard => widget.getClipboard(),
+            .selection, .primary => widget.getPrimaryClipboard(),
+        };
     }
 
     fn showClipboardConfirmation(
@@ -2231,3 +2310,26 @@ const Clipboard = struct {
         state: apprt.ClipboardRequest,
     };
 };
+
+/// Check a GValue to see what's type its wrapping. This is equivalent to GTK's
+/// `G_VALUE_HOLDS` macro but Zig's C translator does not like it.
+fn g_value_holds(value_: ?*gobject.Value, g_type: gobject.Type) bool {
+    if (value_) |value| {
+        if (value.f_g_type == g_type) return true;
+        return gobject.typeCheckValueHolds(value, g_type) != 0;
+    }
+    return false;
+}
+
+/// Compute a fraction [0.0, 1.0] from the supplied progress, which is clamped
+/// to [0, 100].
+fn computeFraction(progress: u8) f64 {
+    return @as(f64, @floatFromInt(std.math.clamp(progress, 0, 100))) / 100.0;
+}
+
+test "computeFraction" {
+    try std.testing.expectEqual(1.0, computeFraction(100));
+    try std.testing.expectEqual(1.0, computeFraction(255));
+    try std.testing.expectEqual(0.0, computeFraction(0));
+    try std.testing.expectEqual(0.5, computeFraction(50));
+}
