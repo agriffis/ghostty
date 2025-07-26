@@ -10,11 +10,13 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const build_config = @import("../../../build_config.zig");
+const i18n = @import("../../../os/main.zig").i18n;
 const apprt = @import("../../../apprt.zig");
 const cgroup = @import("../cgroup.zig");
 const CoreApp = @import("../../../App.zig");
 const configpkg = @import("../../../config.zig");
 const internal_os = @import("../../../os/main.zig");
+const systemd = @import("../../../os/systemd.zig");
 const terminal = @import("../../../terminal/main.zig");
 const xev = @import("../../../global.zig").xev;
 const CoreConfig = configpkg.Config;
@@ -27,6 +29,7 @@ const ApprtApp = @import("../App.zig");
 const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Config = @import("config.zig").Config;
+const Surface = @import("surface.zig").Surface;
 const Window = @import("window.zig").Window;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
@@ -376,6 +379,9 @@ pub const Application = extern struct {
             return;
         }
 
+        // Tell systemd that we are ready.
+        systemd.notify.ready();
+
         log.debug("entering runloop", .{});
         defer log.debug("exiting runloop", .{});
         priv.running = true;
@@ -416,10 +422,16 @@ pub const Application = extern struct {
             return;
         }
 
+        // Get the parent for our dialog
+        const parent: ?*gtk.Widget = parent: {
+            const list = gtk.Window.listToplevels();
+            defer list.free();
+            const focused = list.findCustom(null, findActiveWindow);
+            break :parent @ptrCast(@alignCast(focused.f_data));
+        };
+
         // Show a confirmation dialog
         const dialog: *CloseConfirmationDialog = .new(.app);
-
-        // Connect to the reload signal so we know to reload our config.
         _ = CloseConfirmationDialog.signals.@"close-request".connect(
             dialog,
             *Application,
@@ -429,19 +441,30 @@ pub const Application = extern struct {
         );
 
         // Show it
-        dialog.present();
+        dialog.present(parent);
     }
 
     fn quitNow(self: *Self) void {
-        // Get all our windows and destroy them, forcing them to
-        // free their memory.
+        // Get all our windows and destroy them, forcing them to free.
         const list = gtk.Window.listToplevels();
         defer list.free();
         list.foreach(struct {
             fn callback(data: ?*anyopaque, _: ?*anyopaque) callconv(.c) void {
                 const ptr = data orelse return;
                 const window: *gtk.Window = @ptrCast(@alignCast(ptr));
-                window.destroy();
+
+                // We only want to destroy our windows. These windows own
+                // every other type of window that is possible so this will
+                // trigger a proper shutdown sequence.
+                //
+                // We previously just destroyed ALL windows but this leads to
+                // a double-free with the fcitx ime, because it has a nested
+                // gtk.Window as a property that we don't own and it later
+                // tries to free on its own. I think this is probably a bug in
+                // the fcitx ime widget but still, we don't want a double free!
+                if (gobject.ext.isA(window, Window)) {
+                    window.destroy();
+                }
             }
         }.callback, null);
 
@@ -457,6 +480,9 @@ pub const Application = extern struct {
         value: apprt.Action.Value(action),
     ) !bool {
         switch (action) {
+            .close_tab => Action.close(target, .tab),
+            .close_window => Action.close(target, .window),
+
             .config_change => try Action.configChange(
                 self,
                 target,
@@ -483,7 +509,9 @@ pub const Application = extern struct {
 
             .progress_report => return Action.progressReport(target, value),
 
-            .render => Action.render(self, target),
+            .render => Action.render(target),
+
+            .ring_bell => Action.ringBell(target),
 
             .set_title => Action.setTitle(target, value),
 
@@ -491,12 +519,11 @@ pub const Application = extern struct {
 
             .show_gtk_inspector => Action.showGtkInspector(),
 
+            .toggle_maximize => Action.toggleMaximize(target),
+            .toggle_fullscreen => Action.toggleFullscreen(target),
+
             // Unimplemented but todo on gtk-ng branch
-            .close_window,
-            .toggle_maximize,
-            .toggle_fullscreen,
             .new_tab,
-            .close_tab,
             .goto_tab,
             .move_tab,
             .new_split,
@@ -515,7 +542,6 @@ pub const Application = extern struct {
             .toggle_window_decorations,
             .prompt_title,
             .toggle_quick_terminal,
-            .ring_bell,
             .toggle_command_palette,
             .open_url,
             .close_all_windows,
@@ -665,6 +691,9 @@ pub const Application = extern struct {
         // Setup our style manager (light/dark mode)
         self.startupStyleManager();
 
+        // Setup our action map
+        self.startupActionMap();
+
         // Setup our cgroup for the application.
         self.startupCgroup() catch |err| {
             log.warn("cgroup initialization failed err={}", .{err});
@@ -748,6 +777,30 @@ pub const Application = extern struct {
             self,
             .{ .detail = "dark" },
         );
+    }
+
+    /// Setup our action map.
+    fn startupActionMap(self: *Self) void {
+        const actions = .{
+            .{ "quit", actionQuit, null },
+        };
+
+        const action_map = self.as(gio.ActionMap);
+        inline for (actions) |entry| {
+            const action = gio.SimpleAction.new(
+                entry[0],
+                entry[2],
+            );
+            defer action.unref();
+            _ = gio.SimpleAction.signals.activate.connect(
+                action,
+                *Self,
+                entry[1],
+                self,
+                .{},
+            );
+            action_map.addAction(action.as(gio.Action));
+        }
     }
 
     const CgroupError = error{
@@ -949,6 +1002,17 @@ pub const Application = extern struct {
         dialog.present(null);
     }
 
+    fn actionQuit(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const priv = self.private();
+        priv.core_app.performAction(self.rt(), .quit) catch |err| {
+            log.warn("error quitting err={}", .{err});
+        };
+    }
+
     //----------------------------------------------------------------
     // Boilerplate/Noise
 
@@ -996,6 +1060,16 @@ pub const Application = extern struct {
 
 /// All apprt action handlers
 const Action = struct {
+    pub fn close(
+        target: apprt.Target,
+        scope: Surface.CloseScope,
+    ) void {
+        switch (target) {
+            .app => {},
+            .surface => |v| v.rt_surface.surface.close(scope),
+        }
+    }
+
     pub fn configChange(
         self: *Application,
         target: apprt.Target,
@@ -1084,9 +1158,7 @@ const Action = struct {
         self: *Application,
         parent: ?*CoreSurface,
     ) !void {
-        _ = parent;
-
-        const win = Window.new(self);
+        const win = Window.new(self, parent);
         gtk.Window.present(win.as(gtk.Window));
     }
 
@@ -1131,10 +1203,17 @@ const Action = struct {
         };
     }
 
-    pub fn render(_: *Application, target: apprt.Target) void {
+    pub fn render(target: apprt.Target) void {
         switch (target) {
             .app => {},
             .surface => |v| v.rt_surface.surface.redraw(),
+        }
+    }
+
+    pub fn ringBell(target: apprt.Target) void {
+        switch (target) {
+            .app => {},
+            .surface => |v| v.rt_surface.surface.ringBell(),
         }
     }
 
@@ -1168,6 +1247,20 @@ const Action = struct {
 
     pub fn showGtkInspector() void {
         gtk.Window.setInteractiveDebugging(@intFromBool(true));
+    }
+
+    pub fn toggleFullscreen(target: apprt.Target) void {
+        switch (target) {
+            .app => {},
+            .surface => |v| v.rt_surface.surface.toggleFullscreen(),
+        }
+    }
+
+    pub fn toggleMaximize(target: apprt.Target) void {
+        switch (target) {
+            .app => {},
+            .surface => |v| v.rt_surface.surface.toggleMaximize(),
+        }
     }
 };
 
@@ -1275,4 +1368,13 @@ fn setGtkEnv(config: *const CoreConfig) error{NoSpaceLeft}!void {
         log.warn("setting GDK_DISABLE={s}", .{value[0 .. value.len - 1]});
         _ = internal_os.setenv("GDK_DISABLE", value[0 .. value.len - 1 :0]);
     }
+}
+
+fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) c_int {
+    const window: *gtk.Window = @ptrCast(@alignCast(@constCast(data orelse return -1)));
+
+    // Confusingly, `isActive` returns 1 when active,
+    // but we want to return 0 to indicate equality.
+    // Abusing integers to be enums and booleans is a terrible idea, C.
+    return if (window.isActive() != 0) 0 else -1;
 }
