@@ -132,6 +132,12 @@ pub const Application = extern struct {
         /// glib source for our signal handler.
         signal_source: ?c_uint = null,
 
+        /// CSS Provider for any styles based on Ghostty configuration values.
+        css_provider: *gtk.CssProvider,
+
+        /// Providers for loading custom stylesheets defined by user
+        custom_css_providers: std.ArrayListUnmanaged(*gtk.CssProvider) = .empty,
+
         pub var offset: c_int = 0;
     };
 
@@ -267,6 +273,16 @@ pub const Application = extern struct {
         const config_obj: *Config = try .new(alloc, &config);
         errdefer config_obj.unref();
 
+        // Internally, GTK ensures that only one instance of this provider
+        // exists in the provider list for the display.
+        const css_provider = gtk.CssProvider.new();
+        gtk.StyleContext.addProviderForDisplay(
+            display,
+            css_provider.as(gtk.StyleProvider),
+            gtk.STYLE_PROVIDER_PRIORITY_APPLICATION + 3,
+        );
+        errdefer css_provider.unref();
+
         // Initialize the app.
         const self = gobject.ext.newInstance(Self, .{
             .application_id = app_id.ptr,
@@ -287,7 +303,21 @@ pub const Application = extern struct {
             .core_app = core_app,
             .config = config_obj,
             .winproto = wp,
+            .css_provider = css_provider,
+            .custom_css_providers = .empty,
         };
+
+        // Signals
+        _ = gobject.Object.signals.notify.connect(
+            self,
+            *Self,
+            propConfig,
+            self,
+            .{ .detail = "config" },
+        );
+
+        // Trigger initial config changes
+        self.as(gobject.Object).notifyByPspec(properties.config.impl.param_spec);
 
         return self;
     }
@@ -303,6 +333,22 @@ pub const Application = extern struct {
         priv.config.unref();
         priv.winproto.deinit(alloc);
         if (priv.transient_cgroup_base) |base| alloc.free(base);
+        if (gdk.Display.getDefault()) |display| {
+            gtk.StyleContext.removeProviderForDisplay(
+                display,
+                priv.css_provider.as(gtk.StyleProvider),
+            );
+
+            for (priv.custom_css_providers.items) |provider| {
+                gtk.StyleContext.removeProviderForDisplay(
+                    display,
+                    provider.as(gtk.StyleProvider),
+                );
+            }
+        }
+        priv.css_provider.unref();
+        for (priv.custom_css_providers.items) |provider| provider.unref();
+        priv.custom_css_providers.deinit(alloc);
     }
 
     /// The global allocator that all other classes should use by
@@ -549,7 +595,9 @@ pub const Application = extern struct {
 
             .toggle_maximize => Action.toggleMaximize(target),
             .toggle_fullscreen => Action.toggleFullscreen(target),
+            .toggle_quick_terminal => return Action.toggleQuickTerminal(self),
             .toggle_tab_overview => return Action.toggleTabOverview(target),
+            .toggle_window_decorations => return Action.toggleWindowDecorations(target),
 
             // Unimplemented but todo on gtk-ng branch
             .prompt_title,
@@ -561,9 +609,6 @@ pub const Application = extern struct {
             .equalize_splits,
             .goto_split,
             .toggle_split_zoom,
-            // TODO: winproto
-            .toggle_quick_terminal,
-            .toggle_window_decorations,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
@@ -660,6 +705,155 @@ pub const Application = extern struct {
         }
     }
 
+    fn loadRuntimeCss(
+        self: *Self,
+    ) Allocator.Error!void {
+        const alloc = self.allocator();
+
+        var buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer buf.deinit(alloc);
+
+        const writer = buf.writer(alloc);
+
+        const config = self.private().config.get();
+        const window_theme = config.@"window-theme";
+        const unfocused_fill: CoreConfig.Color = config.@"unfocused-split-fill" orelse config.background;
+        const headerbar_background = config.@"window-titlebar-background" orelse config.background;
+        const headerbar_foreground = config.@"window-titlebar-foreground" orelse config.foreground;
+
+        try writer.print(
+            \\widget.unfocused-split {{
+            \\ opacity: {d:.2};
+            \\ background-color: rgb({d},{d},{d});
+            \\}}
+        , .{
+            1.0 - config.@"unfocused-split-opacity",
+            unfocused_fill.r,
+            unfocused_fill.g,
+            unfocused_fill.b,
+        });
+
+        if (config.@"split-divider-color") |color| {
+            try writer.print(
+                \\.terminal-window .notebook separator {{
+                \\  color: rgb({[r]d},{[g]d},{[b]d});
+                \\  background: rgb({[r]d},{[g]d},{[b]d});
+                \\}}
+            , .{
+                .r = color.r,
+                .g = color.g,
+                .b = color.b,
+            });
+        }
+
+        if (config.@"window-title-font-family") |font_family| {
+            try writer.print(
+                \\.window headerbar {{
+                \\  font-family: "{[font_family]s}";
+                \\}}
+            , .{ .font_family = font_family });
+        }
+
+        switch (window_theme) {
+            .ghostty => try writer.print(
+                \\:root {{
+                \\  --ghostty-fg: rgb({d},{d},{d});
+                \\  --ghostty-bg: rgb({d},{d},{d});
+                \\  --headerbar-fg-color: var(--ghostty-fg);
+                \\  --headerbar-bg-color: var(--ghostty-bg);
+                \\  --headerbar-backdrop-color: oklab(from var(--headerbar-bg-color) calc(l * 0.9) a b / alpha);
+                \\  --overview-fg-color: var(--ghostty-fg);
+                \\  --overview-bg-color: var(--ghostty-bg);
+                \\  --popover-fg-color: var(--ghostty-fg);
+                \\  --popover-bg-color: var(--ghostty-bg);
+                \\  --window-fg-color: var(--ghostty-fg);
+                \\  --window-bg-color: var(--ghostty-bg);
+                \\}}
+                \\windowhandle {{
+                \\  background-color: var(--headerbar-bg-color);
+                \\  color: var(--headerbar-fg-color);
+                \\}}
+                \\windowhandle:backdrop {{
+                \\ background-color: var(--headerbar-backdrop-color);
+                \\}}
+            , .{
+                headerbar_foreground.r,
+                headerbar_foreground.g,
+                headerbar_foreground.b,
+                headerbar_background.r,
+                headerbar_background.g,
+                headerbar_background.b,
+            }),
+            else => {},
+        }
+
+        const data = try alloc.dupeZ(u8, buf.items);
+        defer alloc.free(data);
+
+        // Clears any previously loaded CSS from this provider
+        loadCssProviderFromData(
+            self.private().css_provider,
+            data,
+        );
+    }
+
+    fn loadCustomCss(self: *Self) !void {
+        const priv = self.private();
+        const alloc = self.allocator();
+        const display = gdk.Display.getDefault() orelse {
+            log.warn("unable to get display", .{});
+            return;
+        };
+
+        // unload the previously loaded style providers
+        for (priv.custom_css_providers.items) |provider| {
+            gtk.StyleContext.removeProviderForDisplay(
+                display,
+                provider.as(gtk.StyleProvider),
+            );
+            provider.unref();
+        }
+        priv.custom_css_providers.clearRetainingCapacity();
+
+        const config = priv.config.getMut();
+        for (config.@"gtk-custom-css".value.items) |p| {
+            const path, const optional = switch (p) {
+                .optional => |path| .{ path, true },
+                .required => |path| .{ path, false },
+            };
+            const file = std.fs.openFileAbsolute(path, .{}) catch |err| {
+                if (err != error.FileNotFound or !optional) {
+                    log.warn(
+                        "error opening gtk-custom-css file {s}: {}",
+                        .{ path, err },
+                    );
+                }
+                continue;
+            };
+            defer file.close();
+
+            log.info("loading gtk-custom-css path={s}", .{path});
+            const contents = try file.reader().readAllAlloc(
+                alloc,
+                5 * 1024 * 1024, // 5MB,
+            );
+            defer alloc.free(contents);
+
+            const data = try alloc.dupeZ(u8, contents);
+            defer alloc.free(data);
+
+            const provider = gtk.CssProvider.new();
+            errdefer provider.unref();
+            try priv.custom_css_providers.append(alloc, provider);
+            loadCssProviderFromData(provider, data);
+            gtk.StyleContext.addProviderForDisplay(
+                display,
+                provider.as(gtk.StyleProvider),
+                gtk.STYLE_PROVIDER_PRIORITY_USER,
+            );
+        }
+    }
+
     //---------------------------------------------------------------
     // Properties
 
@@ -683,6 +877,28 @@ pub const Application = extern struct {
 
         // Show our errors if we have any
         self.showConfigErrorsDialog();
+    }
+
+    fn propConfig(
+        _: *Application,
+        _: *gobject.ParamSpec,
+        self: *Self,
+    ) callconv(.c) void {
+        // Load our runtime and custom CSS. If this fails then our window is
+        // just stuck with the old CSS but we don't want to fail the entire
+        // config change operation.
+        self.loadRuntimeCss() catch |err| switch (err) {
+            error.OutOfMemory => log.warn(
+                "out of memory loading runtime CSS, no runtime CSS applied",
+                .{},
+            ),
+        };
+        self.loadCustomCss() catch |err| {
+            log.warn(
+                "failed to load custom CSS, no custom CSS applied, err={}",
+                .{err},
+            );
+        };
     }
 
     //---------------------------------------------------------------
@@ -1477,7 +1693,14 @@ const Action = struct {
         parent: ?*CoreSurface,
     ) !void {
         const win = Window.new(self);
+        initAndShowWindow(self, win, parent);
+    }
 
+    fn initAndShowWindow(
+        self: *Application,
+        win: *Window,
+        parent: ?*CoreSurface,
+    ) void {
         // Setup a binding so that whenever our config changes so does the
         // window. There's never a time when the window config should be out
         // of sync with the application config.
@@ -1694,6 +1917,48 @@ const Action = struct {
         }
     }
 
+    pub fn toggleQuickTerminal(self: *Application) bool {
+        // If we already have a quick terminal window, we just toggle the
+        // visibility of it.
+        if (getQuickTerminalWindow()) |win| {
+            win.toggleVisibility();
+            return true;
+        }
+
+        // If we don't support quick terminals then we do nothing.
+        const priv = self.private();
+        if (!priv.winproto.supportsQuickTerminal()) return false;
+
+        // Create our new window as a quick terminal
+        const win = gobject.ext.newInstance(Window, .{
+            .application = self,
+            .@"quick-terminal" = true,
+        });
+        assert(win.isQuickTerminal());
+        initAndShowWindow(self, win, null);
+        return true;
+    }
+
+    fn getQuickTerminalWindow() ?*Window {
+        // Find a quick terminal window.
+        const list = gtk.Window.listToplevels();
+        defer list.free();
+        if (ext.listFind(gtk.Window, list, struct {
+            fn find(gtk_win: *gtk.Window) bool {
+                const win = gobject.ext.cast(
+                    Window,
+                    gtk_win,
+                ) orelse return false;
+                return win.isQuickTerminal();
+            }
+        }.find)) |w| return gobject.ext.cast(
+            Window,
+            w,
+        ).?;
+
+        return null;
+    }
+
     pub fn toggleMaximize(target: apprt.Target) void {
         switch (target) {
             .app => {},
@@ -1715,6 +1980,25 @@ const Action = struct {
                 };
 
                 window.toggleTabOverview();
+                return true;
+            },
+        }
+    }
+
+    pub fn toggleWindowDecorations(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const window = ext.getAncestor(
+                    Window,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a window, ignoring new_tab", .{});
+                    return false;
+                };
+
+                window.toggleWindowDecorations();
                 return true;
             },
         }
@@ -1834,4 +2118,9 @@ fn findActiveWindow(data: ?*const anyopaque, _: ?*const anyopaque) callconv(.c) 
     // but we want to return 0 to indicate equality.
     // Abusing integers to be enums and booleans is a terrible idea, C.
     return if (window.isActive() != 0) 0 else -1;
+}
+
+fn loadCssProviderFromData(provider: *gtk.CssProvider, data: [:0]const u8) void {
+    assert(gtk_version.runtimeAtLeast(4, 12, 0));
+    provider.loadFromString(data);
 }
