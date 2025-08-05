@@ -15,14 +15,17 @@ const apprt = @import("../../../apprt.zig");
 const cgroup = @import("../cgroup.zig");
 const CoreApp = @import("../../../App.zig");
 const configpkg = @import("../../../config.zig");
+const input = @import("../../../input.zig");
 const internal_os = @import("../../../os/main.zig");
 const systemd = @import("../../../os/systemd.zig");
 const terminal = @import("../../../terminal/main.zig");
 const xev = @import("../../../global.zig").xev;
+const Binding = @import("../../../input.zig").Binding;
 const CoreConfig = configpkg.Config;
 const CoreSurface = @import("../../../Surface.zig");
 
 const ext = @import("../ext.zig");
+const key = @import("../key.zig");
 const adw_version = @import("../adw_version.zig");
 const gtk_version = @import("../gtk_version.zig");
 const winprotopkg = @import("../winproto.zig");
@@ -34,6 +37,7 @@ const Surface = @import("surface.zig").Surface;
 const Window = @import("window.zig").Window;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
+const GlobalShortcuts = @import("global_shortcuts.zig").GlobalShortcuts;
 
 const log = std.log.scoped(.gtk_ghostty_application);
 
@@ -104,6 +108,9 @@ pub const Application = extern struct {
 
         /// State and logic for the underlying windowing protocol.
         winproto: winprotopkg.App,
+
+        /// The global shortcut logic.
+        global_shortcuts: *GlobalShortcuts,
 
         /// The base path of the transient cgroup used to put all surfaces
         /// into their own cgroup. This is only set if cgroups are enabled
@@ -305,6 +312,7 @@ pub const Application = extern struct {
             .winproto = wp,
             .css_provider = css_provider,
             .custom_css_providers = .empty,
+            .global_shortcuts = gobject.ext.newInstance(GlobalShortcuts, .{}),
         };
 
         // Signals
@@ -332,6 +340,7 @@ pub const Application = extern struct {
         const priv = self.private();
         priv.config.unref();
         priv.winproto.deinit(alloc);
+        priv.global_shortcuts.unref();
         if (priv.transient_cgroup_base) |base| alloc.free(base);
         if (gdk.Display.getDefault()) |display| {
             gtk.StyleContext.removeProviderForDisplay(
@@ -854,6 +863,61 @@ pub const Application = extern struct {
         }
     }
 
+    fn syncActionAccelerators(self: *Self) void {
+        self.syncActionAccelerator("app.quit", .{ .quit = {} });
+        self.syncActionAccelerator("app.open-config", .{ .open_config = {} });
+        self.syncActionAccelerator("app.reload-config", .{ .reload_config = {} });
+        self.syncActionAccelerator("win.toggle-inspector", .{ .inspector = .toggle });
+        self.syncActionAccelerator("app.show-gtk-inspector", .show_gtk_inspector);
+        self.syncActionAccelerator("win.toggle-command-palette", .toggle_command_palette);
+        self.syncActionAccelerator("win.close", .{ .close_window = {} });
+        self.syncActionAccelerator("win.new-window", .{ .new_window = {} });
+        self.syncActionAccelerator("win.new-tab", .{ .new_tab = {} });
+        self.syncActionAccelerator("win.close-tab", .{ .close_tab = {} });
+        self.syncActionAccelerator("win.split-right", .{ .new_split = .right });
+        self.syncActionAccelerator("win.split-down", .{ .new_split = .down });
+        self.syncActionAccelerator("win.split-left", .{ .new_split = .left });
+        self.syncActionAccelerator("win.split-up", .{ .new_split = .up });
+        self.syncActionAccelerator("win.copy", .{ .copy_to_clipboard = {} });
+        self.syncActionAccelerator("win.paste", .{ .paste_from_clipboard = {} });
+        self.syncActionAccelerator("win.reset", .{ .reset = {} });
+        self.syncActionAccelerator("win.clear", .{ .clear_screen = {} });
+        self.syncActionAccelerator("win.prompt-title", .{ .prompt_surface_title = {} });
+    }
+
+    fn syncActionAccelerator(
+        self: *Self,
+        gtk_action: [:0]const u8,
+        action: input.Binding.Action,
+    ) void {
+        const gtk_app = self.as(gtk.Application);
+
+        // Reset it initially
+        const zero = [_:null]?[*:0]const u8{};
+        gtk_app.setAccelsForAction(gtk_action, &zero);
+
+        const config = self.private().config.get();
+        const trigger = config.keybind.set.getTrigger(action) orelse return;
+        var buf: [1024]u8 = undefined;
+        const accel = if (key.accelFromTrigger(
+            &buf,
+            trigger,
+        )) |accel_|
+            accel_ orelse return
+        else |err| switch (err) {
+            // This should really never, never happen. Its not critical enough
+            // to actually crash, but this is a bug somewhere. An accelerator
+            // for a trigger can't possibly be more than 1024 bytes.
+            error.NoSpaceLeft => {
+                log.warn("accelerator somehow longer than 1024 bytes: {}", .{trigger});
+                return;
+            },
+        };
+        const accels = [_:null]?[*:0]const u8{accel};
+
+        gtk_app.setAccelsForAction(gtk_action, &accels);
+    }
+
     //---------------------------------------------------------------
     // Properties
 
@@ -884,6 +948,9 @@ pub const Application = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
+        // Sync our accelerators for menu items.
+        self.syncActionAccelerators();
+
         // Load our runtime and custom CSS. If this fails then our window is
         // just stuck with the old CSS but we don't want to fail the entire
         // config change operation.
@@ -934,6 +1001,9 @@ pub const Application = extern struct {
 
         // Setup our action map
         self.startupActionMap();
+
+        // Setup our global shortcuts
+        self.startupGlobalShortcuts();
 
         // Setup our cgroup for the application.
         self.startupCgroup() catch |err| {
@@ -1071,6 +1141,34 @@ pub const Application = extern struct {
             );
             action_map.addAction(action.as(gio.Action));
         }
+    }
+
+    /// Setup our global shortcuts.
+    fn startupGlobalShortcuts(self: *Self) void {
+        const priv = self.private();
+
+        // On startup, our dbus connection should be available.
+        priv.global_shortcuts.setDbusConnection(
+            self.as(gio.Application).getDbusConnection(),
+        );
+
+        // Setup a binding so that the shortcut config always matches the app.
+        _ = gobject.Object.bindProperty(
+            self.as(gobject.Object),
+            "config",
+            priv.global_shortcuts.as(gobject.Object),
+            "config",
+            .{ .sync_create = true },
+        );
+
+        // Setup the signal handler for global shortcut triggers
+        _ = GlobalShortcuts.signals.trigger.connect(
+            priv.global_shortcuts,
+            *Application,
+            globalShortcutTrigger,
+            self,
+            .{},
+        );
     }
 
     const CgroupError = error{
@@ -1301,6 +1399,16 @@ pub const Application = extern struct {
 
         // Show it
         dialog.present(null);
+    }
+
+    fn globalShortcutTrigger(
+        _: *GlobalShortcuts,
+        action: *const Binding.Action,
+        self: *Self,
+    ) callconv(.c) void {
+        self.core().performAllAction(self.rt(), action.*) catch |err| {
+            log.warn("failed to perform action={}", .{err});
+        };
     }
 
     fn actionReloadConfig(
