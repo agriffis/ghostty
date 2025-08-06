@@ -377,6 +377,19 @@ pub const Surface = extern struct {
                 void,
             );
         };
+
+        /// Emitted when this surface requests that the command palette be
+        /// toggled.
+        pub const @"toggle-command-palette" = struct {
+            pub const name = "toggle-command-palette";
+            pub const connect = impl.connect;
+            const impl = gobject.ext.defineSignal(
+                name,
+                Self,
+                &.{},
+                void,
+            );
+        };
     };
 
     const Private = struct {
@@ -564,6 +577,16 @@ pub const Surface = extern struct {
             .{},
             null,
         );
+    }
+
+    pub fn toggleCommandPalette(self: *Self) bool {
+        signals.@"toggle-command-palette".impl.emit(
+            self,
+            null,
+            .{},
+            null,
+        );
+        return true;
     }
 
     /// Set the current progress report state.
@@ -1158,7 +1181,7 @@ pub const Surface = extern struct {
     //---------------------------------------------------------------
     // Virtual Methods
 
-    fn init(self: *Self, _: *Class) callconv(.C) void {
+    fn init(self: *Self, _: *Class) callconv(.c) void {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
 
         const priv = self.private();
@@ -1207,7 +1230,7 @@ pub const Surface = extern struct {
         self.propConfig(undefined, null);
     }
 
-    fn dispose(self: *Self) callconv(.C) void {
+    fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
         if (priv.config) |v| {
             v.unref();
@@ -1231,7 +1254,7 @@ pub const Surface = extern struct {
         );
     }
 
-    fn finalize(self: *Self) callconv(.C) void {
+    fn finalize(self: *Self) callconv(.c) void {
         const priv = self.private();
         if (priv.core_surface) |v| {
             // Remove ourselves from the list of known surfaces in the app.
@@ -1472,7 +1495,7 @@ pub const Surface = extern struct {
         };
 
         // Set our new cursor.
-        priv.gl_area.as(gtk.Widget).setCursorFromName(name.ptr);
+        self.as(gtk.Widget).setCursorFromName(name.ptr);
     }
 
     //---------------------------------------------------------------
@@ -2283,7 +2306,7 @@ pub const Surface = extern struct {
         var parent: *Parent.Class = undefined;
         pub const Instance = Self;
 
-        fn init(class: *Class) callconv(.C) void {
+        fn init(class: *Class) callconv(.c) void {
             gobject.ext.ensureType(ResizeOverlay);
             gobject.ext.ensureType(ChildExited);
             gtk.Widget.Class.setTemplateFromResource(
@@ -2362,6 +2385,7 @@ pub const Surface = extern struct {
             signals.@"present-request".impl.register(.{});
             signals.@"toggle-fullscreen".impl.register(.{});
             signals.@"toggle-maximize".impl.register(.{});
+            signals.@"toggle-command-palette".impl.register(.{});
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
