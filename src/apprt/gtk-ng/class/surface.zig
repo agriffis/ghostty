@@ -9,6 +9,7 @@ const gobject = @import("gobject");
 const gtk = @import("gtk");
 
 const apprt = @import("../../../apprt.zig");
+const datastruct = @import("../../../datastruct/main.zig");
 const font = @import("../../../font/main.zig");
 const input = @import("../../../input.zig");
 const internal_os = @import("../../../os/main.zig");
@@ -42,6 +43,9 @@ pub const Surface = extern struct {
         .private = .{ .Type = Private, .offset = &Private.offset },
     });
 
+    /// A SplitTree implementation that stores surfaces.
+    pub const Tree = datastruct.SplitTree(Self);
+
     pub const properties = struct {
         pub const config = struct {
             pub const name = "config";
@@ -50,8 +54,6 @@ pub const Surface = extern struct {
                 Self,
                 ?*Config,
                 .{
-                    .nick = "Config",
-                    .blurb = "The configuration that this surface is using.",
                     .accessor = C.privateObjFieldAccessor("config"),
                 },
             );
@@ -64,8 +66,6 @@ pub const Surface = extern struct {
                 Self,
                 bool,
                 .{
-                    .nick = "Child Exited",
-                    .blurb = "True when the child process has exited.",
                     .default = false,
                     .accessor = gobject.ext.privateFieldAccessor(
                         Self,
@@ -84,8 +84,6 @@ pub const Surface = extern struct {
                 Self,
                 ?*Size,
                 .{
-                    .nick = "Default Size",
-                    .blurb = "The default size of the window for this surface.",
                     .accessor = C.privateBoxedFieldAccessor("default_size"),
                 },
             );
@@ -98,8 +96,6 @@ pub const Surface = extern struct {
                 Self,
                 ?*font.face.DesiredSize,
                 .{
-                    .nick = "Desired Font Size",
-                    .blurb = "The desired font size, only affects initialization.",
                     .accessor = C.privateBoxedFieldAccessor("font_size_request"),
                 },
             );
@@ -112,8 +108,6 @@ pub const Surface = extern struct {
                 Self,
                 bool,
                 .{
-                    .nick = "Focused",
-                    .blurb = "The focused state of the surface.",
                     .default = false,
                     .accessor = gobject.ext.privateFieldAccessor(
                         Self,
@@ -132,8 +126,6 @@ pub const Surface = extern struct {
                 Self,
                 ?*Size,
                 .{
-                    .nick = "Minimum Size",
-                    .blurb = "The minimum size of the surface.",
                     .accessor = C.privateBoxedFieldAccessor("min_size"),
                 },
             );
@@ -146,8 +138,6 @@ pub const Surface = extern struct {
                 Self,
                 bool,
                 .{
-                    .nick = "Mouse Hidden",
-                    .blurb = "Whether the mouse cursor should be hidden.",
                     .default = false,
                     .accessor = gobject.ext.privateFieldAccessor(
                         Self,
@@ -166,8 +156,6 @@ pub const Surface = extern struct {
                 Self,
                 terminal.MouseShape,
                 .{
-                    .nick = "Mouse Shape",
-                    .blurb = "The current mouse shape to show for the surface.",
                     .default = .text,
                     .accessor = gobject.ext.privateFieldAccessor(
                         Self,
@@ -188,8 +176,6 @@ pub const Surface = extern struct {
                 Self,
                 ?[:0]const u8,
                 .{
-                    .nick = "Mouse Hover URL",
-                    .blurb = "The URL the mouse is currently hovering over (if any).",
                     .default = null,
                     .accessor = C.privateStringFieldAccessor("mouse_hover_url"),
                 },
@@ -205,8 +191,6 @@ pub const Surface = extern struct {
                 Self,
                 ?[:0]const u8,
                 .{
-                    .nick = "Working Directory",
-                    .blurb = "The current working directory as reported by core.",
                     .default = null,
                     .accessor = C.privateStringFieldAccessor("pwd"),
                 },
@@ -222,8 +206,6 @@ pub const Surface = extern struct {
                 Self,
                 ?[:0]const u8,
                 .{
-                    .nick = "Title",
-                    .blurb = "The title of the surface.",
                     .default = null,
                     .accessor = C.privateStringFieldAccessor("title"),
                 },
@@ -237,8 +219,6 @@ pub const Surface = extern struct {
                 Self,
                 bool,
                 .{
-                    .nick = "Zoom",
-                    .blurb = "Whether the surface should be zoomed.",
                     .default = false,
                     .accessor = gobject.ext.privateFieldAccessor(
                         Self,
@@ -1314,6 +1294,11 @@ pub const Surface = extern struct {
         return self.private().pwd;
     }
 
+    /// Returns the focus state of this surface.
+    pub fn getFocused(self: *Self) bool {
+        return self.private().focused;
+    }
+
     /// Change the configuration for this surface.
     pub fn setConfig(self: *Self, config: *Config) void {
         const priv = self.private();
@@ -1650,6 +1635,7 @@ pub const Surface = extern struct {
         priv.focused = true;
         priv.im_context.as(gtk.IMContext).focusIn();
         _ = glib.idleAddOnce(idleFocus, self.ref());
+        self.as(gobject.Object).notifyByPspec(properties.focused.impl.param_spec);
     }
 
     fn ecFocusLeave(_: *gtk.EventControllerFocus, self: *Self) callconv(.c) void {
@@ -1657,6 +1643,7 @@ pub const Surface = extern struct {
         priv.focused = false;
         priv.im_context.as(gtk.IMContext).focusOut();
         _ = glib.idleAddOnce(idleFocus, self.ref());
+        self.as(gobject.Object).notifyByPspec(properties.focused.impl.param_spec);
     }
 
     /// The focus callback must be triggered on an idle loop source because
@@ -2298,6 +2285,7 @@ pub const Surface = extern struct {
     const C = Common(Self, Private);
     pub const as = C.as;
     pub const ref = C.ref;
+    pub const refSink = C.refSink;
     pub const unref = C.unref;
     const private = C.private;
 
