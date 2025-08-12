@@ -119,6 +119,9 @@ pub fn SplitTree(comptime V: type) type {
 
         /// Clone this tree, returning a new tree with the same nodes.
         pub fn clone(self: *const Self, gpa: Allocator) Allocator.Error!Self {
+            // If we're empty then return an empty tree.
+            if (self.isEmpty()) return .empty;
+
             // Create a new arena allocator for the clone.
             var arena = ArenaAllocator.init(gpa);
             errdefer arena.deinit();
@@ -149,16 +152,16 @@ pub fn SplitTree(comptime V: type) type {
             return .{ .nodes = self.nodes };
         }
 
+        pub const ViewEntry = struct {
+            handle: Node.Handle,
+            view: *View,
+        };
+
         pub const Iterator = struct {
             i: Node.Handle = 0,
             nodes: []const Node,
 
-            pub const Entry = struct {
-                handle: Node.Handle,
-                view: *View,
-            };
-
-            pub fn next(self: *Iterator) ?Entry {
+            pub fn next(self: *Iterator) ?ViewEntry {
                 // If we have no nodes, return null.
                 if (self.i >= self.nodes.len) return null;
 
@@ -174,6 +177,235 @@ pub fn SplitTree(comptime V: type) type {
             }
         };
 
+        pub const Goto = union(enum) {
+            /// Previous view, null if we're the first view.
+            previous,
+
+            /// Next view, null if we're the last view.
+            next,
+
+            /// Previous view, but wrapped around to the last view. May
+            /// return the same view if this is the first view.
+            previous_wrapped,
+
+            /// Next view, but wrapped around to the first view. May return
+            /// the same view if this is the last view.
+            next_wrapped,
+
+            /// A spatial direction. "Spatial" means that the direction is
+            /// based on the nearest surface in the given direction visually
+            /// as the surfaces are laid out on a 2D grid.
+            spatial: Spatial.Direction,
+        };
+
+        /// Goto a view from a certain point in the split tree. Returns null
+        /// if the direction results in no visitable view.
+        ///
+        /// Allocator is only used for temporary state for spatial navigation.
+        pub fn goto(
+            self: *const Self,
+            alloc: Allocator,
+            from: Node.Handle,
+            to: Goto,
+        ) Allocator.Error!?Node.Handle {
+            return switch (to) {
+                .previous => self.previous(from),
+                .next => self.next(from),
+                .previous_wrapped => self.previous(from) orelse self.deepest(.right, 0),
+                .next_wrapped => self.next(from) orelse self.deepest(.left, 0),
+                .spatial => |d| spatial: {
+                    // Get our spatial representation.
+                    var sp = try self.spatial(alloc);
+                    defer sp.deinit(alloc);
+                    break :spatial self.nearest(sp, from, d);
+                },
+            };
+        }
+
+        pub const Side = enum { left, right };
+
+        /// Returns the deepest view in the tree in the given direction.
+        /// This can be used to find the leftmost/rightmost surface within
+        /// a given split structure.
+        pub fn deepest(
+            self: *const Self,
+            side: Side,
+            from: Node.Handle,
+        ) Node.Handle {
+            var current: Node.Handle = from;
+            while (true) {
+                switch (self.nodes[current]) {
+                    .leaf => return current,
+                    .split => |s| current = switch (side) {
+                        .left => s.left,
+                        .right => s.right,
+                    },
+                }
+            }
+        }
+
+        /// Returns the previous view from the given node handle (which itself
+        /// doesn't need to be a view). If there is no previous (this is the
+        /// most previous view) then this will return null.
+        ///
+        /// "Previous" is defined as the previous node in an in-order
+        /// traversal of the tree. This isn't a perfect definition and we
+        /// may want to change this to something that better matches a
+        /// spatial view of the tree later.
+        fn previous(self: *const Self, from: Node.Handle) ?Node.Handle {
+            return switch (self.previousBacktrack(from, 0)) {
+                .result => |v| v,
+                .backtrack, .deadend => null,
+            };
+        }
+
+        /// Same as `previous`, but returns the next view instead.
+        fn next(self: *const Self, from: Node.Handle) ?Node.Handle {
+            return switch (self.nextBacktrack(from, 0)) {
+                .result => |v| v,
+                .backtrack, .deadend => null,
+            };
+        }
+
+        // Design note: we use a recursive backtracking search because
+        // split trees are never that deep, so we can abuse the stack as
+        // a safe allocator (stack overflow unlikely unless the kernel is
+        // tuned in some really weird way).
+        const Backtrack = union(enum) {
+            deadend,
+            backtrack,
+            result: Node.Handle,
+        };
+
+        fn previousBacktrack(
+            self: *const Self,
+            from: Node.Handle,
+            current: Node.Handle,
+        ) Backtrack {
+            // If we reached the point that we're trying to find the previous
+            // value of, then we need to backtrack from here.
+            if (from == current) return .backtrack;
+
+            return switch (self.nodes[current]) {
+                // If we hit a leaf that isn't our target, then deadend.
+                .leaf => .deadend,
+
+                .split => |s| switch (self.previousBacktrack(from, s.left)) {
+                    .result => |v| .{ .result = v },
+
+                    // Backtrack from the left means we have to continue
+                    // backtracking because we can't see what's before the left.
+                    .backtrack => .backtrack,
+
+                    // If we hit a deadend on the left then let's move right.
+                    .deadend => switch (self.previousBacktrack(from, s.right)) {
+                        .result => |v| .{ .result = v },
+
+                        // Deadend means its not in this split at all since
+                        // we already tracked the left.
+                        .deadend => .deadend,
+
+                        // Backtrack means that its in our left view because
+                        // we can see the immediate previous and there MUST
+                        // be leaves (we can't have split-only leaves).
+                        .backtrack => .{ .result = self.deepest(.right, s.left) },
+                    },
+                },
+            };
+        }
+
+        // See previousBacktrack for detailed comments. This is a mirror
+        // of that.
+        fn nextBacktrack(
+            self: *const Self,
+            from: Node.Handle,
+            current: Node.Handle,
+        ) Backtrack {
+            if (from == current) return .backtrack;
+            return switch (self.nodes[current]) {
+                .leaf => .deadend,
+                .split => |s| switch (self.nextBacktrack(from, s.right)) {
+                    .result => |v| .{ .result = v },
+                    .backtrack => .backtrack,
+                    .deadend => switch (self.nextBacktrack(from, s.left)) {
+                        .result => |v| .{ .result = v },
+                        .deadend => .deadend,
+                        .backtrack => .{ .result = self.deepest(.left, s.right) },
+                    },
+                },
+            };
+        }
+
+        /// Returns the nearest leaf node (view) in the given direction.
+        fn nearest(
+            self: *const Self,
+            sp: Spatial,
+            from: Node.Handle,
+            direction: Spatial.Direction,
+        ) ?Node.Handle {
+            const target = sp.slots[from];
+
+            var result: ?struct {
+                handle: Node.Handle,
+                distance: f16,
+            } = null;
+            for (sp.slots, 0..) |slot, handle| {
+                // Never match ourself
+                if (handle == from) continue;
+
+                // Only match leaves
+                switch (self.nodes[handle]) {
+                    .leaf => {},
+                    .split => continue,
+                }
+
+                // Ensure it is in the proper direction
+                if (!switch (direction) {
+                    .left => slot.maxX() <= target.x,
+                    .right => slot.x >= target.maxX(),
+                    .up => slot.maxY() <= target.y,
+                    .down => slot.y >= target.maxY(),
+                }) continue;
+
+                // Track our distance
+                const dx = slot.x - target.x;
+                const dy = slot.y - target.y;
+                const distance = @sqrt(dx * dx + dy * dy);
+
+                // If we have a nearest it must be closer.
+                if (result) |n| {
+                    if (distance >= n.distance) continue;
+                }
+                result = .{
+                    .handle = @intCast(handle),
+                    .distance = distance,
+                };
+            }
+
+            return if (result) |n| n.handle else null;
+        }
+
+        /// Resize the given node in place. The node MUST be a split (asserted).
+        ///
+        /// In general, this is an immutable data structure so this is
+        /// heavily discouraged. However, this is provided for convenience
+        /// and performance reasons where its very important for GUIs to
+        /// update the ratio during a live resize than to redraw the entire
+        /// widget tree.
+        pub fn resizeInPlace(
+            self: *Self,
+            at: Node.Handle,
+            ratio: f16,
+        ) void {
+            // Let's talk about this constCast. Our member are const but
+            // we actually always own their memory. We don't want consumers
+            // who directly access the nodes to be able to modify them
+            // (without nasty stuff like this), but given this is internal
+            // usage its perfectly fine to modify the node in-place.
+            const s: *Split = @constCast(&self.nodes[at].split);
+            s.ratio = ratio;
+        }
+
         /// Insert another tree into this tree at the given node in the
         /// specified direction. The other tree will be inserted in the
         /// new direction. For example, if the direction is "right" then
@@ -187,6 +419,7 @@ pub fn SplitTree(comptime V: type) type {
             gpa: Allocator,
             at: Node.Handle,
             direction: Split.Direction,
+            ratio: f16,
             insert: *const Self,
         ) Allocator.Error!Self {
             // The new arena for our new tree.
@@ -231,7 +464,7 @@ pub fn SplitTree(comptime V: type) type {
             nodes[nodes.len - 1] = nodes[at];
             nodes[at] = .{ .split = .{
                 .layout = layout,
-                .ratio = 0.5,
+                .ratio = ratio,
                 .left = @intCast(if (left) self.nodes.len else nodes.len - 1),
                 .right = @intCast(if (left) nodes.len - 1 else self.nodes.len),
             } };
@@ -409,6 +642,93 @@ pub fn SplitTree(comptime V: type) type {
             assert(reffed == nodes.len - 1);
         }
 
+        /// Equalize this node and all its children, returning a new node with splits
+        /// adjusted so that each split's ratio is based on the relative weight
+        /// (number of leaves) of its children.
+        pub fn equalize(
+            self: *const Self,
+            gpa: Allocator,
+        ) Allocator.Error!Self {
+            if (self.isEmpty()) return .empty;
+
+            // Create a new arena allocator for the clone.
+            var arena = ArenaAllocator.init(gpa);
+            errdefer arena.deinit();
+            const alloc = arena.allocator();
+
+            // Allocate a new nodes array and copy the existing nodes into it.
+            const nodes = try alloc.dupe(Node, self.nodes);
+
+            // Go through and equalize our ratios based on weights.
+            for (nodes) |*node| switch (node.*) {
+                .leaf => {},
+                .split => |*s| {
+                    const weight_left = self.weight(s.left, s.layout, 0);
+                    const weight_right = self.weight(s.right, s.layout, 0);
+                    assert(weight_left > 0);
+                    assert(weight_right > 0);
+                    const total_f16: f16 = @floatFromInt(weight_left + weight_right);
+                    const weight_left_f16: f16 = @floatFromInt(weight_left);
+                    s.ratio = weight_left_f16 / total_f16;
+                },
+            };
+
+            // Increase the reference count of all the views in the nodes.
+            try refNodes(gpa, nodes);
+
+            return .{
+                .arena = arena,
+                .nodes = nodes,
+            };
+        }
+
+        fn weight(
+            self: *const Self,
+            from: Node.Handle,
+            layout: Split.Layout,
+            acc: usize,
+        ) usize {
+            return switch (self.nodes[from]) {
+                .leaf => acc + 1,
+                .split => |s| if (s.layout == layout)
+                    self.weight(s.left, layout, acc) +
+                        self.weight(s.right, layout, acc)
+                else
+                    1,
+            };
+        }
+
+        /// Spatial representation of the split tree. See spatial.
+        pub const Spatial = struct {
+            /// The slots of the spatial representation in the same order
+            /// as the tree it was created from.
+            slots: []const Slot,
+
+            pub const empty: Spatial = .{ .slots = &.{} };
+
+            pub const Direction = enum { left, right, down, up };
+
+            const Slot = struct {
+                x: f16,
+                y: f16,
+                width: f16,
+                height: f16,
+
+                fn maxX(self: *const Slot) f16 {
+                    return self.x + self.width;
+                }
+
+                fn maxY(self: *const Slot) f16 {
+                    return self.y + self.height;
+                }
+            };
+
+            pub fn deinit(self: *Spatial, alloc: Allocator) void {
+                alloc.free(self.slots);
+                self.* = undefined;
+            }
+        };
+
         /// Spatial representation of the split tree. This can be used to
         /// better understand the layout of the tree in a 2D space.
         ///
@@ -425,28 +745,6 @@ pub fn SplitTree(comptime V: type) type {
         /// may not be available at various times because GUI toolkits often
         /// only make them available once they're part of a widget tree and
         /// a SplitTree can represent views that aren't currently visible.
-        pub const Spatial = struct {
-            /// The slots of the spatial representation in the same order
-            /// as the tree it was created from.
-            slots: []const Slot,
-
-            pub const empty: Spatial = .{ .slots = &.{} };
-
-            const Slot = struct {
-                x: f16,
-                y: f16,
-                width: f16,
-                height: f16,
-            };
-
-            pub fn deinit(self: *const Spatial, alloc: Allocator) void {
-                alloc.free(self.slots);
-                self.* = undefined;
-            }
-        };
-
-        /// Returns the spatial representation of this tree. See Spatial
-        /// for more details.
         pub fn spatial(
             self: *const Self,
             alloc: Allocator,
@@ -549,14 +847,20 @@ pub fn SplitTree(comptime V: type) type {
             };
         }
 
-        /// Format the tree in a human-readable format.
+        /// Format the tree in a human-readable format. By default this will
+        /// output a diagram followed by a textual representation. This can
+        /// be controlled via the formatting string:
+        ///
+        ///   - `diagram` - Output a diagram of the split tree only.
+        ///   - `text` - Output a textual representation of the split tree only.
+        ///   - Empty - Output both a diagram and a textual representation.
+        ///
         pub fn format(
             self: *const Self,
             comptime fmt: []const u8,
             options: std.fmt.FormatOptions,
             writer: anytype,
         ) !void {
-            _ = fmt;
             _ = options;
 
             if (self.nodes.len == 0) {
@@ -564,6 +868,48 @@ pub fn SplitTree(comptime V: type) type {
                 return;
             }
 
+            if (std.mem.eql(u8, fmt, "diagram")) {
+                self.formatDiagram(writer) catch
+                    try writer.writeAll("failed to draw split tree diagram");
+            } else if (std.mem.eql(u8, fmt, "text")) {
+                try self.formatText(writer, 0, 0);
+            } else if (fmt.len == 0) {
+                self.formatDiagram(writer) catch {};
+                try self.formatText(writer, 0, 0);
+            } else {
+                return error.InvalidFormat;
+            }
+        }
+
+        fn formatText(
+            self: *const Self,
+            writer: anytype,
+            current: Node.Handle,
+            depth: usize,
+        ) !void {
+            for (0..depth) |_| try writer.writeAll("  ");
+
+            switch (self.nodes[current]) {
+                .leaf => |v| if (@hasDecl(View, "splitTreeLabel"))
+                    try writer.print("leaf: {s}\n", .{v.splitTreeLabel()})
+                else
+                    try writer.print("leaf: {d}\n", .{current}),
+
+                .split => |s| {
+                    try writer.print("split (layout: {s}, ratio: {d:.2})\n", .{
+                        @tagName(s.layout),
+                        s.ratio,
+                    });
+                    try self.formatText(writer, s.left, depth + 1);
+                    try self.formatText(writer, s.right, depth + 1);
+                },
+            }
+        }
+
+        fn formatDiagram(
+            self: *const Self,
+            writer: anytype,
+        ) !void {
             // Use our arena's GPA to allocate some intermediate memory.
             // Requiring allocation for formatting is nasty but this is really
             // only used for debugging and testing and shouldn't hit OOM
@@ -573,7 +919,29 @@ pub fn SplitTree(comptime V: type) type {
             const alloc = arena.allocator();
 
             // Get our spatial representation.
-            const sp = try self.spatial(alloc);
+            const sp = spatial: {
+                const sp = try self.spatial(alloc);
+
+                // Scale our spatial representation to have minimum width/height 1.
+                var min_w: f16 = 1;
+                var min_h: f16 = 1;
+                for (sp.slots) |slot| {
+                    min_w = @min(min_w, slot.width);
+                    min_h = @min(min_h, slot.height);
+                }
+
+                const ratio_w: f16 = 1 / min_w;
+                const ratio_h: f16 = 1 / min_h;
+                const slots = try alloc.dupe(Spatial.Slot, sp.slots);
+                for (slots) |*slot| {
+                    slot.x *= ratio_w;
+                    slot.y *= ratio_h;
+                    slot.width *= ratio_w;
+                    slot.height *= ratio_h;
+                }
+
+                break :spatial .{ .slots = slots };
+            };
 
             // The width we need for the largest label.
             const max_label_width: usize = max_label_width: {
@@ -610,6 +978,8 @@ pub fn SplitTree(comptime V: type) type {
             // the width/height based on node 0.
             const grid = grid: {
                 // Get our initial width/height. Each leaf is 1x1 in this.
+                // We round up for this because partial widths/heights should
+                // take up an extra cell.
                 var width: usize = @intFromFloat(@ceil(sp.slots[0].width));
                 var height: usize = @intFromFloat(@ceil(sp.slots[0].height));
 
@@ -637,10 +1007,10 @@ pub fn SplitTree(comptime V: type) type {
                     .split => continue,
                 }
 
-                var x: usize = @intFromFloat(@ceil(slot.x));
-                var y: usize = @intFromFloat(@ceil(slot.y));
-                var width: usize = @intFromFloat(@ceil(slot.width));
-                var height: usize = @intFromFloat(@ceil(slot.height));
+                var x: usize = @intFromFloat(@floor(slot.x));
+                var y: usize = @intFromFloat(@floor(slot.y));
+                var width: usize = @intFromFloat(@max(@floor(slot.width), 1));
+                var height: usize = @intFromFloat(@max(@floor(slot.height), 1));
                 x *= cell_width;
                 y *= cell_height;
                 width *= cell_width;
@@ -684,6 +1054,12 @@ pub fn SplitTree(comptime V: type) type {
 
             // Output every row
             for (grid) |row| {
+                // We currently have a bug in our height calculation that
+                // results in trailing blank lines. Ignore those. We should
+                // really fix our height calculation instead. If someone wants
+                // to do that just remove this line and see the tests that fail
+                // and go from there.
+                if (row[0] == ' ') break;
                 try writer.writeAll(row);
             }
         }
@@ -731,8 +1107,10 @@ pub fn SplitTree(comptime V: type) type {
                         .copy = &struct {
                             fn copy(self: *Self) callconv(.c) *Self {
                                 const ptr = @import("glib").ext.create(Self);
-                                const alloc = self.arena.child_allocator;
-                                ptr.* = self.clone(alloc) catch @panic("oom");
+                                ptr.* = if (self.nodes.len == 0)
+                                    .empty
+                                else
+                                    self.clone(self.arena.child_allocator) catch @panic("oom");
                                 return ptr;
                             }
                         }.copy,
@@ -793,7 +1171,7 @@ test "SplitTree: single node" {
     var t: TestTree = try .init(alloc, &v);
     defer t.deinit();
 
-    const str = try std.fmt.allocPrint(alloc, "{}", .{t});
+    const str = try std.fmt.allocPrint(alloc, "{diagram}", .{t});
     defer alloc.free(str);
     try testing.expectEqualStrings(str,
         \\+---+
@@ -806,29 +1184,165 @@ test "SplitTree: single node" {
 test "SplitTree: split horizontal" {
     const testing = std.testing;
     const alloc = testing.allocator;
+
     var v1: TestTree.View = .{ .label = "A" };
     var t1: TestTree = try .init(alloc, &v1);
     defer t1.deinit();
     var v2: TestTree.View = .{ .label = "B" };
     var t2: TestTree = try .init(alloc, &v2);
     defer t2.deinit();
-
     var t3 = try t1.split(
         alloc,
         0, // at root
         .right, // split right
+        0.5,
         &t2, // insert t2
     );
     defer t3.deinit();
 
-    const str = try std.fmt.allocPrint(alloc, "{}", .{t3});
-    defer alloc.free(str);
-    try testing.expectEqualStrings(str,
-        \\+---++---+
-        \\| A || B |
-        \\+---++---+
-        \\
+    {
+        const str = try std.fmt.allocPrint(alloc, "{}", .{t3});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+---++---+
+            \\| A || B |
+            \\+---++---+
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  leaf: A
+            \\  leaf: B
+            \\
+        );
+    }
+
+    // Split right at B
+    var vC: TestTree.View = .{ .label = "C" };
+    var tC: TestTree = try .init(alloc, &vC);
+    defer tC.deinit();
+    var it = t3.iterator();
+    var t4 = try t3.split(
+        alloc,
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "B")) {
+                break entry.handle;
+            }
+        } else return error.NotFound,
+        .right,
+        0.5,
+        &tC,
     );
+    defer t4.deinit();
+
+    {
+        const str = try std.fmt.allocPrint(alloc, "{}", .{t4});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+--------++---++---+
+            \\|    A   || B || C |
+            \\+--------++---++---+
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  leaf: A
+            \\  split (layout: horizontal, ratio: 0.50)
+            \\    leaf: B
+            \\    leaf: C
+            \\
+        );
+    }
+
+    // Split right at C
+    var vD: TestTree.View = .{ .label = "D" };
+    var tD: TestTree = try .init(alloc, &vD);
+    defer tD.deinit();
+    it = t4.iterator();
+    var t5 = try t4.split(
+        alloc,
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.view.label, "C")) {
+                break entry.handle;
+            }
+        } else return error.NotFound,
+        .right,
+        0.5,
+        &tD,
+    );
+    defer t5.deinit();
+
+    {
+        const str = try std.fmt.allocPrint(alloc, "{}", .{t5});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(
+            \\+------------------++--------++---++---+
+            \\|         A        ||    B   || C || D |
+            \\+------------------++--------++---++---+
+            \\split (layout: horizontal, ratio: 0.50)
+            \\  leaf: A
+            \\  split (layout: horizontal, ratio: 0.50)
+            \\    leaf: B
+            \\    split (layout: horizontal, ratio: 0.50)
+            \\      leaf: C
+            \\      leaf: D
+            \\
+        , str);
+    }
+
+    // Find "previous" from D back.
+    {
+        var current: u8 = 'D';
+        while (current != 'A') : (current -= 1) {
+            it = t5.iterator();
+            const handle = t5.previous(
+                while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, &.{current})) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound,
+            ).?;
+
+            const entry = t5.nodes[handle].leaf;
+            try testing.expectEqualStrings(
+                entry.label,
+                &.{current - 1},
+            );
+        }
+
+        it = t5.iterator();
+        try testing.expect(t5.previous(
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, &.{current})) {
+                    break entry.handle;
+                }
+            } else return error.NotFound,
+        ) == null);
+    }
+
+    // Find "next" from A forward.
+    {
+        var current: u8 = 'A';
+        while (current != 'D') : (current += 1) {
+            it = t5.iterator();
+            const handle = t5.next(
+                while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, &.{current})) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound,
+            ).?;
+
+            const entry = t5.nodes[handle].leaf;
+            try testing.expectEqualStrings(
+                entry.label,
+                &.{current + 1},
+            );
+        }
+
+        it = t5.iterator();
+        try testing.expect(t5.next(
+            while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, &.{current})) {
+                    break entry.handle;
+                }
+            } else return error.NotFound,
+        ) == null);
+    }
 }
 
 test "SplitTree: split vertical" {
@@ -846,11 +1360,12 @@ test "SplitTree: split vertical" {
         alloc,
         0, // at root
         .down, // split down
+        0.5,
         &t2, // insert t2
     );
     defer t3.deinit();
 
-    const str = try std.fmt.allocPrint(alloc, "{}", .{t3});
+    const str = try std.fmt.allocPrint(alloc, "{diagram}", .{t3});
     defer alloc.free(str);
     try testing.expectEqualStrings(str,
         \\+---+
@@ -877,6 +1392,7 @@ test "SplitTree: remove leaf" {
         alloc,
         0, // at root
         .right, // split right
+        0.5,
         &t2, // insert t2
     );
     defer t3.deinit();
@@ -893,7 +1409,7 @@ test "SplitTree: remove leaf" {
     );
     defer t4.deinit();
 
-    const str = try std.fmt.allocPrint(alloc, "{}", .{t4});
+    const str = try std.fmt.allocPrint(alloc, "{diagram}", .{t4});
     defer alloc.free(str);
     try testing.expectEqualStrings(str,
         \\+---+
@@ -922,6 +1438,7 @@ test "SplitTree: split twice, remove intermediary" {
         alloc,
         0, // at root
         .right, // split right
+        0.5,
         &t2, // insert t2
     );
     defer split1.deinit();
@@ -931,12 +1448,13 @@ test "SplitTree: split twice, remove intermediary" {
         alloc,
         0, // at root
         .down, // split down
+        0.5,
         &t3, // insert t3
     );
     defer split2.deinit();
 
     {
-        const str = try std.fmt.allocPrint(alloc, "{}", .{split2});
+        const str = try std.fmt.allocPrint(alloc, "{diagram}", .{split2});
         defer alloc.free(str);
         try testing.expectEqualStrings(str,
             \\+---++---+
@@ -962,7 +1480,7 @@ test "SplitTree: split twice, remove intermediary" {
     defer split3.deinit();
 
     {
-        const str = try std.fmt.allocPrint(alloc, "{}", .{split3});
+        const str = try std.fmt.allocPrint(alloc, "{diagram}", .{split3});
         defer alloc.free(str);
         try testing.expectEqualStrings(str,
             \\+---+
@@ -981,5 +1499,160 @@ test "SplitTree: split twice, remove intermediary" {
     for (0..split2.nodes.len) |i| {
         var t = try split2.remove(alloc, @intCast(i));
         t.deinit();
+    }
+}
+
+test "SplitTree: spatial goto" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+    var v4: TestTree.View = .{ .label = "D" };
+    var t4: TestTree = try .init(alloc, &v4);
+    defer t4.deinit();
+
+    // A | B horizontal
+    var splitAB = try t1.split(
+        alloc,
+        0, // at root
+        .right, // split right
+        0.5,
+        &t2, // insert t2
+    );
+    defer splitAB.deinit();
+
+    // A | C vertical
+    var splitAC = try splitAB.split(
+        alloc,
+        at: {
+            var it = splitAB.iterator();
+            break :at while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, "A")) {
+                    break entry.handle;
+                }
+            } else return error.NotFound;
+        },
+        .down, // split down
+        0.8,
+        &t3, // insert t3
+    );
+    defer splitAC.deinit();
+
+    // B | D vertical
+    var splitBD = try splitAC.split(
+        alloc,
+        at: {
+            var it = splitAB.iterator();
+            break :at while (it.next()) |entry| {
+                if (std.mem.eql(u8, entry.view.label, "B")) {
+                    break entry.handle;
+                }
+            } else return error.NotFound;
+        },
+        .down, // split down
+        0.3,
+        &t4, // insert t4
+    );
+    defer splitBD.deinit();
+    const split = splitBD;
+
+    {
+        const str = try std.fmt.allocPrint(alloc, "{diagram}", .{split});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+---++---+
+            \\|   || B |
+            \\|   |+---+
+            \\|   |+---+
+            \\| A ||   |
+            \\|   ||   |
+            \\|   ||   |
+            \\|   || D |
+            \\+---+|   |
+            \\+---+|   |
+            \\| C ||   |
+            \\+---++---+
+            \\
+        );
+    }
+
+    // Spatial C => right
+    {
+        const target = (try split.goto(
+            alloc,
+            from: {
+                var it = split.iterator();
+                break :from while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, "C")) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound;
+            },
+            .{ .spatial = .right },
+        )).?;
+        const view = split.nodes[target].leaf;
+        try testing.expectEqualStrings(view.label, "D");
+    }
+
+    // Spatial D => left
+    {
+        const target = (try split.goto(
+            alloc,
+            from: {
+                var it = split.iterator();
+                break :from while (it.next()) |entry| {
+                    if (std.mem.eql(u8, entry.view.label, "D")) {
+                        break entry.handle;
+                    }
+                } else return error.NotFound;
+            },
+            .{ .spatial = .left },
+        )).?;
+        const view = split.nodes[target].leaf;
+        try testing.expectEqualStrings("A", view.label);
+    }
+
+    // Equalize
+    var equal = try split.equalize(alloc);
+    defer equal.deinit();
+
+    {
+        const str = try std.fmt.allocPrint(alloc, "{diagram}", .{equal});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\+---++---+
+            \\| A || B |
+            \\+---++---+
+            \\+---++---+
+            \\| C || D |
+            \\+---++---+
+            \\
+        );
+    }
+}
+
+test "SplitTree: clone empty tree" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+    var t: TestTree = .empty;
+    defer t.deinit();
+
+    var t2 = try t.clone(alloc);
+    defer t2.deinit();
+
+    {
+        const str = try std.fmt.allocPrint(alloc, "{}", .{t2});
+        defer alloc.free(str);
+        try testing.expectEqualStrings(str,
+            \\empty
+        );
     }
 }

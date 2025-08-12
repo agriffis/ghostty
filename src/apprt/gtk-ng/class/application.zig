@@ -34,6 +34,7 @@ const Common = @import("../class.zig").Common;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const Config = @import("config.zig").Config;
 const Surface = @import("surface.zig").Surface;
+const SplitTree = @import("split_tree.zig").SplitTree;
 const Window = @import("window.zig").Window;
 const CloseConfirmationDialog = @import("close_confirmation_dialog.zig").CloseConfirmationDialog;
 const ConfigErrorsDialog = @import("config_errors_dialog.zig").ConfigErrorsDialog;
@@ -132,7 +133,7 @@ pub const Application = extern struct {
         /// If non-null, we're currently showing a config errors dialog.
         /// This is a WeakRef because the dialog can close on its own
         /// outside of our own lifecycle and that's okay.
-        config_errors_dialog: WeakRef(ConfigErrorsDialog) = .{},
+        config_errors_dialog: WeakRef(ConfigErrorsDialog) = .empty,
 
         /// glib source for our signal handler.
         signal_source: ?c_uint = null,
@@ -552,6 +553,10 @@ pub const Application = extern struct {
 
             .desktop_notification => Action.desktopNotification(self, target, value),
 
+            .equalize_splits => return Action.equalizeSplits(target),
+
+            .goto_split => return Action.gotoSplit(target, value),
+
             .goto_tab => return Action.gotoTab(target, value),
 
             .initial_size => return Action.initialSize(target, value),
@@ -561,6 +566,8 @@ pub const Application = extern struct {
             .mouse_visibility => Action.mouseVisibility(target, value),
 
             .move_tab => return Action.moveTab(target, value),
+
+            .new_split => return Action.newSplit(target, value),
 
             .new_tab => return Action.newTab(target),
 
@@ -611,10 +618,7 @@ pub const Application = extern struct {
             .prompt_title,
             .inspector,
             // TODO: splits
-            .new_split,
             .resize_split,
-            .equalize_splits,
-            .goto_split,
             .toggle_split_zoom,
             => {
                 log.warn("unimplemented action={}", .{action});
@@ -742,7 +746,7 @@ pub const Application = extern struct {
 
         if (config.@"split-divider-color") |color| {
             try writer.print(
-                \\.terminal-window .notebook separator {{
+                \\.window .split paned > separator {{
                 \\  color: rgb({[r]d},{[g]d},{[b]d});
                 \\  background: rgb({[r]d},{[g]d},{[b]d});
                 \\}}
@@ -881,6 +885,10 @@ pub const Application = extern struct {
         self.syncActionAccelerator("win.reset", .{ .reset = {} });
         self.syncActionAccelerator("win.clear", .{ .clear_screen = {} });
         self.syncActionAccelerator("win.prompt-title", .{ .prompt_surface_title = {} });
+        self.syncActionAccelerator("split-tree.new-left", .{ .new_split = .left });
+        self.syncActionAccelerator("split-tree.new-right", .{ .new_split = .right });
+        self.syncActionAccelerator("split-tree.new-up", .{ .new_split = .up });
+        self.syncActionAccelerator("split-tree.new-down", .{ .new_split = .down });
     }
 
     fn syncActionAccelerator(
@@ -1257,6 +1265,7 @@ pub const Application = extern struct {
             diag.close();
             diag.unref(); // strong ref from get()
         }
+        priv.config_errors_dialog.set(null);
         if (priv.signal_source) |v| {
             if (glib.Source.remove(v) == 0) {
                 log.warn("unable to remove signal source", .{});
@@ -1644,6 +1653,52 @@ const Action = struct {
         gio_app.sendNotification(n.body, notification);
     }
 
+    pub fn equalizeSplits(target: apprt.Target) bool {
+        switch (target) {
+            .app => {
+                log.warn("equalize splits to app is unexpected", .{});
+                return false;
+            },
+
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                return surface.as(gtk.Widget).activateAction("split-tree.equalize", null) != 0;
+            },
+        }
+    }
+
+    pub fn gotoSplit(
+        target: apprt.Target,
+        to: apprt.action.GotoSplit,
+    ) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                // Design note: we can't use widget actions here because
+                // we need to know whether there is a goto target for returning
+                // the proper perform result (boolean).
+
+                const surface = core.rt_surface.surface;
+                const tree = ext.getAncestor(
+                    SplitTree,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a split tree, ignoring goto_split", .{});
+                    return false;
+                };
+
+                return tree.goto(switch (to) {
+                    .previous => .previous_wrapped,
+                    .next => .next_wrapped,
+                    .up => .{ .spatial = .up },
+                    .down => .{ .spatial = .down },
+                    .left => .{ .spatial = .left },
+                    .right => .{ .spatial = .right },
+                });
+            },
+        }
+    }
+
     pub fn gotoTab(
         target: apprt.Target,
         tab: apprt.action.GotoTab,
@@ -1742,6 +1797,28 @@ const Action = struct {
                     surface,
                     @intCast(value.amount),
                 );
+            },
+        }
+    }
+
+    pub fn newSplit(
+        target: apprt.Target,
+        direction: apprt.action.SplitDirection,
+    ) bool {
+        switch (target) {
+            .app => {
+                log.warn("new split to app is unexpected", .{});
+                return false;
+            },
+
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                return surface.as(gtk.Widget).activateAction(switch (direction) {
+                    .right => "split-tree.new-right",
+                    .left => "split-tree.new-left",
+                    .down => "split-tree.new-down",
+                    .up => "split-tree.new-up",
+                }, null) != 0;
             },
         }
     }
