@@ -79,6 +79,25 @@ pub const SplitTree = extern struct {
             );
         };
 
+        pub const @"is-zoomed" = struct {
+            pub const name = "is-zoomed";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                bool,
+                .{
+                    .default = false,
+                    .accessor = gobject.ext.typedAccessor(
+                        Self,
+                        bool,
+                        .{
+                            .getter = getIsZoomed,
+                        },
+                    ),
+                },
+            );
+        };
+
         pub const tree = struct {
             pub const name = "tree";
             const impl = gobject.ext.defineProperty(
@@ -165,6 +184,7 @@ pub const SplitTree = extern struct {
             .{ "new-down", actionNewDown, null },
 
             .{ "equalize", actionEqualize, null },
+            .{ "zoom", actionZoom, null },
         };
 
         // We need to collect our actions into a group since we're just
@@ -241,7 +261,7 @@ pub const SplitTree = extern struct {
 
         // The handle we create the split relative to. Today this is the active
         // surface but this might be the handle of the given parent if we want.
-        const handle = self.getActiveSurfaceHandle() orelse 0;
+        const handle = self.getActiveSurfaceHandle() orelse .root;
 
         // Create our split!
         var new_tree = try old_tree.split(
@@ -259,6 +279,51 @@ pub const SplitTree = extern struct {
 
         // Replace our tree
         self.setTree(&new_tree);
+    }
+
+    pub fn resize(
+        self: *Self,
+        direction: Surface.Tree.Split.Direction,
+        amount: u16,
+    ) Allocator.Error!bool {
+        // Avoid useless work
+        if (amount == 0) return false;
+
+        const old_tree = self.getTree() orelse return false;
+        const active = self.getActiveSurfaceHandle() orelse return false;
+
+        // Get all our dimensions we're going to need to turn our
+        // amount into a percentage.
+        const priv = self.private();
+        const width = priv.tree_bin.as(gtk.Widget).getWidth();
+        const height = priv.tree_bin.as(gtk.Widget).getHeight();
+        if (width == 0 or height == 0) return false;
+        const width_f64: f64 = @floatFromInt(width);
+        const height_f64: f64 = @floatFromInt(height);
+        const amount_f64: f64 = @floatFromInt(amount);
+
+        // Get our ratio and use positive/neg for directions.
+        const ratio: f64 = switch (direction) {
+            .right => amount_f64 / width_f64,
+            .left => -(amount_f64 / width_f64),
+            .down => amount_f64 / height_f64,
+            .up => -(amount_f64 / height_f64),
+        };
+
+        const layout: Surface.Tree.Split.Layout = switch (direction) {
+            .left, .right => .horizontal,
+            .up, .down => .vertical,
+        };
+
+        var new_tree = try old_tree.resize(
+            Application.default().allocator(),
+            active,
+            layout,
+            @floatCast(ratio),
+        );
+        defer new_tree.deinit();
+        self.setTree(&new_tree);
+        return true;
     }
 
     /// Move focus from the currently focused surface to the given
@@ -283,7 +348,7 @@ pub const SplitTree = extern struct {
         if (active == target) return false;
 
         // Get the surface at the target location and grab focus.
-        const surface = tree.nodes[target].leaf;
+        const surface = tree.nodes[target.idx()].leaf;
         surface.grabFocus();
 
         return true;
@@ -343,7 +408,7 @@ pub const SplitTree = extern struct {
     pub fn getActiveSurface(self: *Self) ?*Surface {
         const tree = self.getTree() orelse return null;
         const handle = self.getActiveSurfaceHandle() orelse return null;
-        return tree.nodes[handle].leaf;
+        return tree.nodes[handle.idx()].leaf;
     }
 
     fn getActiveSurfaceHandle(self: *Self) ?Surface.Tree.Node.Handle {
@@ -351,6 +416,20 @@ pub const SplitTree = extern struct {
         var it = tree.iterator();
         while (it.next()) |entry| {
             if (entry.view.getFocused()) return entry.handle;
+        }
+
+        // If none are currently focused, the most previously focused
+        // surface (if it exists) is our active surface. This lets things
+        // like apprt actions and bell ringing continue to work in the
+        // background.
+        if (self.private().last_focused.get()) |v| {
+            defer v.unref();
+
+            // We need to find the handle of the last focused surface.
+            it = tree.iterator();
+            while (it.next()) |entry| {
+                if (entry.view == v) return entry.handle;
+            }
         }
 
         return null;
@@ -382,6 +461,11 @@ pub const SplitTree = extern struct {
     pub fn getHasSurfaces(self: *Self) bool {
         const tree: *const Surface.Tree = self.private().tree orelse &.empty;
         return !tree.isEmpty();
+    }
+
+    pub fn getIsZoomed(self: *Self) bool {
+        const tree: *const Surface.Tree = self.private().tree orelse &.empty;
+        return tree.zoomed != null;
     }
 
     /// Get the tree data model that we're showing in this widget. This
@@ -555,6 +639,23 @@ pub const SplitTree = extern struct {
         self.setTree(&new_tree);
     }
 
+    pub fn actionZoom(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Self,
+    ) callconv(.c) void {
+        const tree = self.getTree() orelse return;
+        if (tree.zoomed != null) {
+            tree.zoomed = null;
+        } else {
+            const active = self.getActiveSurfaceHandle() orelse return;
+            if (tree.zoomed == active) return;
+            tree.zoom(active);
+        }
+
+        self.as(gobject.Object).notifyByPspec(properties.tree.impl.param_spec);
+    }
+
     fn surfaceCloseRequest(
         surface: *Surface,
         scope: *const Surface.CloseScope,
@@ -634,7 +735,7 @@ pub const SplitTree = extern struct {
             // Note: we don't need to ref this or anything because its
             // guaranteed to remain in the new tree since its not part
             // of the handle we're removing.
-            break :next_focus old_tree.nodes[next_handle].leaf;
+            break :next_focus old_tree.nodes[next_handle.idx()].leaf;
         };
 
         // Remove it from the tree.
@@ -736,6 +837,7 @@ pub const SplitTree = extern struct {
 
         // Dependent properties
         self.as(gobject.Object).notifyByPspec(properties.@"has-surfaces".impl.param_spec);
+        self.as(gobject.Object).notifyByPspec(properties.@"is-zoomed".impl.param_spec);
     }
 
     fn onRebuild(ud: ?*anyopaque) callconv(.c) c_int {
@@ -752,7 +854,10 @@ pub const SplitTree = extern struct {
         // Rebuild our tree
         const tree: *const Surface.Tree = self.private().tree orelse &.empty;
         if (!tree.isEmpty()) {
-            priv.tree_bin.setChild(self.buildTree(tree, 0));
+            priv.tree_bin.setChild(self.buildTree(
+                tree,
+                tree.zoomed orelse .root,
+            ));
         }
 
         // If we have a last focused surface, we need to refocus it, because
@@ -778,7 +883,7 @@ pub const SplitTree = extern struct {
         tree: *const Surface.Tree,
         current: Surface.Tree.Node.Handle,
     ) *gtk.Widget {
-        return switch (tree.nodes[current]) {
+        return switch (tree.nodes[current.idx()]) {
             .leaf => |v| v.as(gtk.Widget),
             .split => |s| SplitTreeSplit.new(
                 current,
@@ -818,6 +923,7 @@ pub const SplitTree = extern struct {
             gobject.ext.registerProperties(class, &.{
                 properties.@"active-surface".impl,
                 properties.@"has-surfaces".impl,
+                properties.@"is-zoomed".impl,
                 properties.tree.impl,
             });
 
@@ -937,7 +1043,7 @@ const SplitTreeSplit = extern struct {
             self.as(gtk.Widget),
         ) orelse return 0;
         const tree = split_tree.getTree() orelse return 0;
-        const split: *const Surface.Tree.Split = &tree.nodes[priv.handle].split;
+        const split: *const Surface.Tree.Split = &tree.nodes[priv.handle.idx()].split;
 
         // Current, min, and max positions as pixels.
         const pos = paned.getPosition();

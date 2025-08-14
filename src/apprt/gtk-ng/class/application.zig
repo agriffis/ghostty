@@ -589,6 +589,8 @@ pub const Application = extern struct {
 
             .progress_report => return Action.progressReport(target, value),
 
+            .prompt_title => return Action.promptTitle(target),
+
             .quit => self.quit(),
 
             .quit_timer => try Action.quitTimer(self, value),
@@ -596,6 +598,8 @@ pub const Application = extern struct {
             .reload_config => try Action.reloadConfig(self, target, value),
 
             .render => Action.render(target),
+
+            .resize_split => return Action.resizeSplit(target, value),
 
             .ring_bell => Action.ringBell(target),
 
@@ -613,13 +617,11 @@ pub const Application = extern struct {
             .toggle_tab_overview => return Action.toggleTabOverview(target),
             .toggle_window_decorations => return Action.toggleWindowDecorations(target),
             .toggle_command_palette => return Action.toggleCommandPalette(target),
+            .toggle_split_zoom => return Action.toggleSplitZoom(target),
+            .show_on_screen_keyboard => return Action.showOnScreenKeyboard(target),
 
             // Unimplemented but todo on gtk-ng branch
-            .prompt_title,
             .inspector,
-            // TODO: splits
-            .resize_split,
-            .toggle_split_zoom,
             => {
                 log.warn("unimplemented action={}", .{action});
                 return false;
@@ -1955,6 +1957,16 @@ const Action = struct {
         };
     }
 
+    pub fn promptTitle(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |v| {
+                v.rt_surface.surface.promptTitle();
+                return true;
+            },
+        }
+    }
+
     /// Reload the configuration for the application and propagate it
     /// across the entire application and all terminals.
     pub fn reloadConfig(
@@ -2003,10 +2015,47 @@ const Action = struct {
         }
     }
 
+    pub fn resizeSplit(
+        target: apprt.Target,
+        value: apprt.action.ResizeSplit,
+    ) bool {
+        switch (target) {
+            .app => {
+                log.warn("resize_split to app is unexpected", .{});
+                return false;
+            },
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                const tree = ext.getAncestor(
+                    SplitTree,
+                    surface.as(gtk.Widget),
+                ) orelse {
+                    log.warn("surface is not in a split tree, ignoring goto_split", .{});
+                    return false;
+                };
+
+                return tree.resize(
+                    switch (value.direction) {
+                        .up => .up,
+                        .down => .down,
+                        .left => .left,
+                        .right => .right,
+                    },
+                    value.amount,
+                ) catch |err| switch (err) {
+                    error.OutOfMemory => {
+                        log.warn("unable to resize split, out of memory", .{});
+                        return false;
+                    },
+                };
+            },
+        }
+    }
+
     pub fn ringBell(target: apprt.Target) void {
         switch (target) {
             .app => {},
-            .surface => |v| v.rt_surface.surface.ringBell(),
+            .surface => |v| v.rt_surface.surface.setBellRinging(true),
         }
     }
 
@@ -2081,6 +2130,36 @@ const Action = struct {
         assert(win.isQuickTerminal());
         initAndShowWindow(self, win, null);
         return true;
+    }
+
+    pub fn toggleSplitZoom(target: apprt.Target) bool {
+        switch (target) {
+            .app => {
+                log.warn("toggle_split_zoom to app is unexpected", .{});
+                return false;
+            },
+
+            .surface => |core| {
+                // TODO: pass surface ID when we have that
+                const surface = core.rt_surface.surface;
+                return surface.as(gtk.Widget).activateAction("split-tree.zoom", null) != 0;
+            },
+        }
+    }
+
+    pub fn showOnScreenKeyboard(target: apprt.Target) bool {
+        switch (target) {
+            .app => {
+                log.warn("show_on_screen_keyboard to app is unexpected", .{});
+                return false;
+            },
+            // NOTE: Even though `activateOsk` takes a gdk.Event, it's currently
+            // unused by all implementations of `activateOsk` as of GTK 4.18.
+            // The commit that introduced the method (ce6aa73c) clarifies that
+            // the event *may* be used by other IM backends, but for Linux desktop
+            // environments this doesn't matter.
+            .surface => |v| return v.rt_surface.surface.showOnScreenKeyboard(null),
+        }
     }
 
     fn getQuickTerminalWindow() ?*Window {

@@ -336,6 +336,7 @@ pub const Window = extern struct {
             .{ "close-tab", actionCloseTab, null },
             .{ "new-tab", actionNewTab, null },
             .{ "new-window", actionNewWindow, null },
+            .{ "ring-bell", actionRingBell, null },
             .{ "split-right", actionSplitRight, null },
             .{ "split-left", actionSplitLeft, null },
             .{ "split-up", actionSplitUp, null },
@@ -414,6 +415,12 @@ pub const Window = extern struct {
             "title",
             page.as(gobject.Object),
             "title",
+            .{ .sync_create = true },
+        );
+        _ = tab.as(gobject.Object).bindProperty(
+            "tooltip",
+            page.as(gobject.Object),
+            "tooltip",
             .{ .sync_create = true },
         );
 
@@ -1060,6 +1067,21 @@ pub const Window = extern struct {
         });
     }
 
+    fn closureSubtitle(
+        _: *Self,
+        config_: ?*Config,
+        pwd_: ?[*:0]const u8,
+    ) callconv(.c) ?[*:0]const u8 {
+        const config = if (config_) |v| v.get() else return null;
+        return switch (config.@"window-subtitle") {
+            .false => null,
+            .@"working-directory" => pwd: {
+                const pwd = pwd_ orelse return null;
+                break :pwd glib.ext.dupeZ(u8, std.mem.span(pwd));
+            },
+        };
+    }
+
     //---------------------------------------------------------------
     // Virtual methods
 
@@ -1296,6 +1318,10 @@ pub const Window = extern struct {
         // Setup our binding group. This ensures things like the title
         // are synced from the active tab.
         priv.tab_bindings.setSource(child.as(gobject.Object));
+
+        // If the tab was previously marked as needing attention
+        // (e.g. due to a bell character), we now unmark that
+        page.setNeedsAttention(@intFromBool(false));
     }
 
     fn tabViewPageAttached(
@@ -1708,6 +1734,30 @@ pub const Window = extern struct {
         self.performBindingAction(.clear_screen);
     }
 
+    fn actionRingBell(
+        _: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        self: *Window,
+    ) callconv(.c) void {
+        const priv = self.private();
+        const config = if (priv.config) |v| v.get() else return;
+
+        if (config.@"bell-features".system) system: {
+            const native = self.as(gtk.Native).getSurface() orelse {
+                log.warn("unable to get native surface from window", .{});
+                break :system;
+            };
+            native.beep();
+        }
+
+        if (config.@"bell-features".attention) {
+            // Request user attention
+            self.winproto().setUrgent(true) catch |err| {
+                log.warn("failed to request user attention={}", .{err});
+            };
+        }
+    }
+
     /// Toggle the command palette.
     ///
     /// TODO: accept the surface that toggled the command palette as a parameter
@@ -1783,6 +1833,9 @@ pub const Window = extern struct {
 
         fn init(class: *Class) callconv(.c) void {
             gobject.ext.ensureType(DebugWarning);
+            gobject.ext.ensureType(SplitTree);
+            gobject.ext.ensureType(Surface);
+            gobject.ext.ensureType(Tab);
             gtk.Widget.Class.setTemplateFromResource(
                 class.as(gtk.Widget.Class),
                 comptime gresource.blueprint(.{
@@ -1832,6 +1885,7 @@ pub const Window = extern struct {
             class.bindTemplateCallback("notify_quick_terminal", &propQuickTerminal);
             class.bindTemplateCallback("notify_scale_factor", &propScaleFactor);
             class.bindTemplateCallback("titlebar_style_is_tabs", &closureTitlebarStyleIsTab);
+            class.bindTemplateCallback("computed_subtitle", &closureSubtitle);
 
             // Virtual methods
             gobject.Object.virtual_methods.dispose.implement(class, &dispose);
