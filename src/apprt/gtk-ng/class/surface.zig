@@ -29,6 +29,8 @@ const ChildExited = @import("surface_child_exited.zig").SurfaceChildExited;
 const ClipboardConfirmationDialog = @import("clipboard_confirmation_dialog.zig").ClipboardConfirmationDialog;
 const TitleDialog = @import("surface_title_dialog.zig").SurfaceTitleDialog;
 const Window = @import("window.zig").Window;
+const WeakRef = @import("../weak_ref.zig").WeakRef;
+const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -273,7 +275,7 @@ pub const Surface = extern struct {
             const impl = gobject.ext.defineSignal(
                 name,
                 Self,
-                &.{*const CloseScope},
+                &.{},
                 void,
             );
         };
@@ -470,6 +472,9 @@ pub const Surface = extern struct {
         // false by a parent widget.
         bell_ringing: bool = false,
 
+        /// A weak reference to an inspector window.
+        inspector: ?*InspectorWindow = null,
+
         // Template binds
         child_exited_overlay: *ChildExited,
         context_menu: *gtk.PopoverMenu,
@@ -518,10 +523,18 @@ pub const Surface = extern struct {
         priv.font_size_request = font_size_ptr;
         self.as(gobject.Object).notifyByPspec(properties.@"font-size-request".impl.param_spec);
 
-        // Setup our pwd
-        if (parent.rt_surface.surface.getPwd()) |pwd| {
-            priv.pwd = glib.ext.dupeZ(u8, pwd);
-            self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
+        // Remainder needs a config. If there is no config we just assume
+        // we aren't inheriting any of these values.
+        if (priv.config) |config_obj| {
+            const config = config_obj.get();
+
+            // Setup our pwd if configured to inherit
+            if (config.@"window-inherit-working-directory") {
+                if (parent.rt_surface.surface.getPwd()) |pwd| {
+                    priv.pwd = glib.ext.dupeZ(u8, pwd);
+                    self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
+                }
+            }
         }
     }
 
@@ -571,6 +584,36 @@ pub const Surface = extern struct {
     pub fn toggleCommandPalette(self: *Self) bool {
         // TODO: pass the surface with the action
         return self.as(gtk.Widget).activateAction("win.toggle-command-palette", null) != 0;
+    }
+
+    pub fn controlInspector(
+        self: *Self,
+        value: apprt.Action.Value(.inspector),
+    ) bool {
+        // Let's see if we have an inspector already.
+        const priv = self.private();
+        if (priv.inspector) |inspector| switch (value) {
+            .show => {},
+            // Our weak ref will set our private value to null
+            .toggle, .hide => inspector.as(gtk.Window).destroy(),
+        } else switch (value) {
+            .toggle, .show => {
+                const inspector = InspectorWindow.new(self);
+                inspector.present();
+                inspector.as(gobject.Object).weakRef(inspectorWeakNotify, self);
+                priv.inspector = inspector;
+            },
+
+            .hide => {},
+        }
+
+        return true;
+    }
+
+    /// Redraw our inspector, if there is one associated with this surface.
+    pub fn redrawInspector(self: *Self) void {
+        const priv = self.private();
+        if (priv.inspector) |v| v.queueRender();
     }
 
     pub fn showOnScreenKeyboard(self: *Self, event: ?*gdk.Event) bool {
@@ -1012,11 +1055,11 @@ pub const Surface = extern struct {
     //---------------------------------------------------------------
     // Libghostty Callbacks
 
-    pub fn close(self: *Self, scope: CloseScope) void {
+    pub fn close(self: *Self) void {
         signals.@"close-request".impl.emit(
             self,
             null,
-            .{&scope},
+            .{},
             null,
         );
     }
@@ -1198,7 +1241,7 @@ pub const Surface = extern struct {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
 
         // Initialize our actions
-        self.initActions();
+        self.initActionMap();
 
         const priv = self.private();
 
@@ -1246,51 +1289,22 @@ pub const Surface = extern struct {
         self.propConfig(undefined, null);
     }
 
-    fn initActions(self: *Self) void {
-        // The set of actions. Each action has (in order):
-        // [0] The action name
-        // [1] The callback function
-        // [2] The glib.VariantType of the parameter
-        //
-        // For action names:
-        // https://docs.gtk.org/gio/type_func.Action.name_is_valid.html
-        const actions = .{
-            .{ "prompt-title", actionPromptTitle, null },
+    fn initActionMap(self: *Self) void {
+        const actions = [_]ext.actions.Action(Self){
+            .init("prompt-title", actionPromptTitle, null),
         };
 
-        // We need to collect our actions into a group since we're just
-        // a plain widget that doesn't implement ActionGroup directly.
-        const group = gio.SimpleActionGroup.new();
-        errdefer group.unref();
-        const map = group.as(gio.ActionMap);
-        inline for (actions) |entry| {
-            const action = gio.SimpleAction.new(
-                entry[0],
-                entry[2],
-            );
-            defer action.unref();
-            _ = gio.SimpleAction.signals.activate.connect(
-                action,
-                *Self,
-                entry[1],
-                self,
-                .{},
-            );
-            map.addAction(action.as(gio.Action));
-        }
-
-        self.as(gtk.Widget).insertActionGroup(
-            "surface",
-            group.as(gio.ActionGroup),
-        );
+        ext.actions.addAsGroup(Self, self, "surface", &actions);
     }
 
     fn dispose(self: *Self) callconv(.c) void {
         const priv = self.private();
+
         if (priv.config) |v| {
             v.unref();
             priv.config = null;
         }
+
         if (priv.progress_bar_timer) |timer| {
             if (glib.Source.remove(timer) == 0) {
                 log.warn("unable to remove progress bar timer", .{});
@@ -1316,6 +1330,10 @@ pub const Surface = extern struct {
             // We do this before deinit in case a callback triggers
             // searching for this surface.
             Application.default().core().deleteSurface(self.rt());
+
+            // NOTE: We must deinit the surface in the finalize call and NOT
+            // the dispose call because the inspector widget relies on this
+            // behavior with a weakRef to properly deactivate.
 
             // Deinit the surface
             v.deinit();
@@ -1708,7 +1726,7 @@ pub const Surface = extern struct {
         self: *Self,
     ) callconv(.c) void {
         // This closes the surface with no confirmation.
-        self.close(.{ .surface = false });
+        self.close();
     }
 
     fn contextMenuClosed(
@@ -1721,6 +1739,15 @@ pub const Surface = extern struct {
         self.grabFocus();
     }
 
+    fn inspectorWeakNotify(
+        ud: ?*anyopaque,
+        _: *gobject.Object,
+    ) callconv(.c) void {
+        const self: *Self = @ptrCast(@alignCast(ud orelse return));
+        const priv = self.private();
+        priv.inspector = null;
+    }
+
     fn dtDrop(
         _: *gtk.DropTarget,
         value: *gobject.Value,
@@ -1730,10 +1757,7 @@ pub const Surface = extern struct {
     ) callconv(.c) c_int {
         const alloc = Application.default().allocator();
 
-        if (g_value_holds(
-            value,
-            gdk.FileList.getGObjectType(),
-        )) {
+        if (ext.gValueHolds(value, gdk.FileList.getGObjectType())) {
             var data = std.ArrayList(u8).init(alloc);
             defer data.deinit();
 
@@ -1777,7 +1801,7 @@ pub const Surface = extern struct {
             return 1;
         }
 
-        if (g_value_holds(value, gio.File.getGObjectType())) {
+        if (ext.gValueHolds(value, gio.File.getGObjectType())) {
             const object = value.getObject() orelse return 0;
             const file = gobject.ext.cast(gio.File, object) orelse return 0;
             const path = file.getPath() orelse return 0;
@@ -1805,7 +1829,7 @@ pub const Surface = extern struct {
             return 1;
         }
 
-        if (g_value_holds(value, gobject.ext.types.string)) {
+        if (ext.gValueHolds(value, gobject.ext.types.string)) {
             if (value.getString()) |string| {
                 Clipboard.paste(self, std.mem.span(string));
             }
@@ -2659,25 +2683,6 @@ pub const Surface = extern struct {
         pub const bindTemplateCallback = C.Class.bindTemplateCallback;
     };
 
-    /// The scope of a close request.
-    pub const CloseScope = union(enum) {
-        /// Close the surface. The boolean determines if there is a
-        /// process active.
-        surface: bool,
-
-        /// Close the tab. We can't know if there are processes active
-        /// for the entire tab scope so listeners must query the app.
-        tab,
-
-        /// Close the window.
-        window,
-
-        pub const getGObjectType = gobject.ext.defineBoxed(
-            CloseScope,
-            .{ .name = "GhosttySurfaceCloseScope" },
-        );
-    };
-
     /// Simple dimensions struct for the surface used by various properties.
     pub const Size = extern struct {
         width: u32,
@@ -3007,16 +3012,6 @@ const Clipboard = struct {
         state: apprt.ClipboardRequest,
     };
 };
-
-/// Check a GValue to see what's type its wrapping. This is equivalent to GTK's
-/// `G_VALUE_HOLDS` macro but Zig's C translator does not like it.
-fn g_value_holds(value_: ?*gobject.Value, g_type: gobject.Type) bool {
-    if (value_) |value| {
-        if (value.f_g_type == g_type) return true;
-        return gobject.typeCheckValueHolds(value, g_type) != 0;
-    }
-    return false;
-}
 
 /// Compute a fraction [0.0, 1.0] from the supplied progress, which is clamped
 /// to [0, 100].

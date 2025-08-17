@@ -160,58 +160,26 @@ pub const SplitTree = extern struct {
         gtk.Widget.initTemplate(self.as(gtk.Widget));
 
         // Initialize our actions
-        self.initActions();
+        self.initActionMap();
 
         // Initialize some basic state
         const priv = self.private();
         priv.pending_close = null;
     }
 
-    fn initActions(self: *Self) void {
-        // The set of actions. Each action has (in order):
-        // [0] The action name
-        // [1] The callback function
-        // [2] The glib.VariantType of the parameter
-        //
-        // For action names:
-        // https://docs.gtk.org/gio/type_func.Action.name_is_valid.html
-        const actions = .{
+    fn initActionMap(self: *Self) void {
+        const s_variant_type = glib.ext.VariantType.newFor([:0]const u8);
+        defer s_variant_type.free();
+
+        const actions = [_]ext.actions.Action(Self){
             // All of these will eventually take a target surface parameter.
             // For now all our targets originate from the focused surface.
-            .{ "new-left", actionNewLeft, null },
-            .{ "new-right", actionNewRight, null },
-            .{ "new-up", actionNewUp, null },
-            .{ "new-down", actionNewDown, null },
-
-            .{ "equalize", actionEqualize, null },
-            .{ "zoom", actionZoom, null },
+            .init("new-split", actionNewSplit, s_variant_type),
+            .init("equalize", actionEqualize, null),
+            .init("zoom", actionZoom, null),
         };
 
-        // We need to collect our actions into a group since we're just
-        // a plain widget that doesn't implement ActionGroup directly.
-        const group = gio.SimpleActionGroup.new();
-        errdefer group.unref();
-        const map = group.as(gio.ActionMap);
-        inline for (actions) |entry| {
-            const action = gio.SimpleAction.new(
-                entry[0],
-                entry[2],
-            );
-            defer action.unref();
-            _ = gio.SimpleAction.signals.activate.connect(
-                action,
-                *Self,
-                entry[1],
-                self,
-                .{},
-            );
-            map.addAction(action.as(gio.Action));
-        }
-
-        self.as(gtk.Widget).insertActionGroup(
-            "split-tree",
-            group.as(gio.ActionGroup),
-        );
+        ext.actions.addAsGroup(Self, self, "split-tree", &actions);
     }
 
     /// Create a new split in the given direction from the currently
@@ -403,6 +371,22 @@ pub const SplitTree = extern struct {
     //---------------------------------------------------------------
     // Properties
 
+    /// Returns true if this split tree needs confirmation before quitting based
+    /// on the various Ghostty configurations.
+    pub fn getNeedsConfirmQuit(self: *Self) bool {
+        const tree = self.getTree() orelse return false;
+        var it = tree.iterator();
+        while (it.next()) |entry| {
+            if (entry.view.core()) |core| {
+                if (core.needsConfirmQuit()) {
+                    return true;
+                }
+            }
+        }
+
+        return false;
+    }
+
     /// Get the currently active surface. See the "active-surface" property.
     /// This does not ref the value.
     pub fn getActiveSurface(self: *Self) ?*Surface {
@@ -567,56 +551,30 @@ pub const SplitTree = extern struct {
     //---------------------------------------------------------------
     // Signal handlers
 
-    pub fn actionNewLeft(
+    pub fn actionNewSplit(
         _: *gio.SimpleAction,
-        parameter_: ?*glib.Variant,
+        args_: ?*glib.Variant,
         self: *Self,
     ) callconv(.c) void {
-        _ = parameter_;
-        self.newSplit(
-            .left,
-            self.getActiveSurface(),
-        ) catch |err| {
-            log.warn("new split failed error={}", .{err});
+        const args = args_ orelse {
+            log.warn("split-tree.new-split called without a parameter", .{});
+            return;
         };
-    }
 
-    pub fn actionNewRight(
-        _: *gio.SimpleAction,
-        parameter_: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        _ = parameter_;
-        self.newSplit(
-            .right,
-            self.getActiveSurface(),
-        ) catch |err| {
-            log.warn("new split failed error={}", .{err});
+        var dir: ?[*:0]const u8 = null;
+        args.get("&s", &dir);
+
+        const direction = std.meta.stringToEnum(
+            Surface.Tree.Split.Direction,
+            std.mem.span(dir) orelse return,
+        ) orelse {
+            // Need to be defensive here since actions can be triggered externally.
+            log.warn("invalid split direction for split-tree.new-split: {s}", .{dir.?});
+            return;
         };
-    }
 
-    pub fn actionNewUp(
-        _: *gio.SimpleAction,
-        parameter_: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        _ = parameter_;
         self.newSplit(
-            .up,
-            self.getActiveSurface(),
-        ) catch |err| {
-            log.warn("new split failed error={}", .{err});
-        };
-    }
-
-    pub fn actionNewDown(
-        _: *gio.SimpleAction,
-        parameter_: ?*glib.Variant,
-        self: *Self,
-    ) callconv(.c) void {
-        _ = parameter_;
-        self.newSplit(
-            .down,
+            direction,
             self.getActiveSurface(),
         ) catch |err| {
             log.warn("new split failed error={}", .{err});
@@ -658,18 +616,8 @@ pub const SplitTree = extern struct {
 
     fn surfaceCloseRequest(
         surface: *Surface,
-        scope: *const Surface.CloseScope,
         self: *Self,
     ) callconv(.c) void {
-        switch (scope.*) {
-            // Handled upstream... this will probably go away for widget
-            // actions eventually.
-            .window, .tab => return,
-
-            // Remove the surface from the tree.
-            .surface => {},
-        }
-
         const core = surface.core() orelse return;
 
         // Reset our pending close state

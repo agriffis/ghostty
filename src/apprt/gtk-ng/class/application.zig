@@ -542,8 +542,8 @@ pub const Application = extern struct {
         value: apprt.Action.Value(action),
     ) !bool {
         switch (action) {
-            .close_tab => Action.close(target, .tab),
-            .close_window => Action.close(target, .window),
+            .close_tab => return Action.closeTab(target),
+            .close_window => return Action.closeWindow(target),
 
             .config_change => try Action.configChange(
                 self,
@@ -560,6 +560,8 @@ pub const Application = extern struct {
             .goto_tab => return Action.gotoTab(target, value),
 
             .initial_size => return Action.initialSize(target, value),
+
+            .inspector => return Action.controlInspector(target, value),
 
             .mouse_over_link => Action.mouseOverLink(target, value),
             .mouse_shape => Action.mouseShape(target, value),
@@ -619,13 +621,6 @@ pub const Application = extern struct {
             .toggle_command_palette => return Action.toggleCommandPalette(target),
             .toggle_split_zoom => return Action.toggleSplitZoom(target),
             .show_on_screen_keyboard => return Action.showOnScreenKeyboard(target),
-
-            // Unimplemented but todo on gtk-ng branch
-            .inspector,
-            => {
-                log.warn("unimplemented action={}", .{action});
-                return false;
-            },
 
             // Unimplemented
             .secure_input,
@@ -887,10 +882,10 @@ pub const Application = extern struct {
         self.syncActionAccelerator("win.reset", .{ .reset = {} });
         self.syncActionAccelerator("win.clear", .{ .clear_screen = {} });
         self.syncActionAccelerator("win.prompt-title", .{ .prompt_surface_title = {} });
-        self.syncActionAccelerator("split-tree.new-left", .{ .new_split = .left });
-        self.syncActionAccelerator("split-tree.new-right", .{ .new_split = .right });
-        self.syncActionAccelerator("split-tree.new-up", .{ .new_split = .up });
-        self.syncActionAccelerator("split-tree.new-down", .{ .new_split = .down });
+        self.syncActionAccelerator("split-tree.new-split::left", .{ .new_split = .left });
+        self.syncActionAccelerator("split-tree.new-split::right", .{ .new_split = .right });
+        self.syncActionAccelerator("split-tree.new-split::up", .{ .new_split = .up });
+        self.syncActionAccelerator("split-tree.new-split::down", .{ .new_split = .down });
     }
 
     fn syncActionAccelerator(
@@ -1096,6 +1091,11 @@ pub const Application = extern struct {
             self,
             .{ .detail = "dark" },
         );
+
+        // Do an initial color scheme sync. This is idempotent and does nothing
+        // if our current theme matches what libghostty has so its safe to
+        // call.
+        handleStyleManagerDark(style, undefined, self);
     }
 
     /// Setup signal handlers
@@ -1117,38 +1117,16 @@ pub const Application = extern struct {
         const as_variant_type = glib.VariantType.new("as");
         defer as_variant_type.free();
 
-        // The set of actions. Each action has (in order):
-        // [0] The action name
-        // [1] The callback function
-        // [2] The glib.VariantType of the parameter
-        //
-        // For action names:
-        // https://docs.gtk.org/gio/type_func.Action.name_is_valid.html
-        const actions = .{
-            .{ "new-window", actionNewWindow, null },
-            .{ "new-window-command", actionNewWindow, as_variant_type },
-            .{ "open-config", actionOpenConfig, null },
-            .{ "present-surface", actionPresentSurface, t_variant_type },
-            .{ "quit", actionQuit, null },
-            .{ "reload-config", actionReloadConfig, null },
+        const actions = [_]ext.actions.Action(Self){
+            .init("new-window", actionNewWindow, null),
+            .init("new-window-command", actionNewWindow, as_variant_type),
+            .init("open-config", actionOpenConfig, null),
+            .init("present-surface", actionPresentSurface, t_variant_type),
+            .init("quit", actionQuit, null),
+            .init("reload-config", actionReloadConfig, null),
         };
 
-        const action_map = self.as(gio.ActionMap);
-        inline for (actions) |entry| {
-            const action = gio.SimpleAction.new(
-                entry[0],
-                entry[2],
-            );
-            defer action.unref();
-            _ = gio.SimpleAction.signals.activate.connect(
-                action,
-                *Self,
-                entry[1],
-                self,
-                .{},
-            );
-            action_map.addAction(action.as(gio.Action));
-        }
+        ext.actions.add(Self, self, &actions);
     }
 
     /// Setup our global shortcuts.
@@ -1331,14 +1309,25 @@ pub const Application = extern struct {
         _: *gobject.ParamSpec,
         self: *Self,
     ) callconv(.c) void {
-        _ = self;
-
-        const color_scheme: apprt.ColorScheme = if (style.getDark() == 0)
+        const scheme: apprt.ColorScheme = if (style.getDark() == 0)
             .light
         else
             .dark;
+        log.debug("style manager changed scheme={}", .{scheme});
 
-        log.debug("style manager changed scheme={}", .{color_scheme});
+        const priv = self.private();
+        const core_app = priv.core_app;
+        core_app.colorSchemeEvent(self.rt(), scheme) catch |err| {
+            log.warn("error updating app color scheme err={}", .{err});
+        };
+        for (core_app.surfaces.items) |surface| {
+            surface.core().colorSchemeCallback(scheme) catch |err| {
+                log.warn(
+                    "unable to tell surface about color scheme change err={}",
+                    .{err},
+                );
+            };
+        }
     }
 
     fn handleReloadConfig(
@@ -1587,13 +1576,23 @@ pub const Application = extern struct {
 
 /// All apprt action handlers
 const Action = struct {
-    pub fn close(
-        target: apprt.Target,
-        scope: Surface.CloseScope,
-    ) void {
+    pub fn closeTab(target: apprt.Target) bool {
         switch (target) {
-            .app => {},
-            .surface => |v| v.rt_surface.surface.close(scope),
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                return surface.as(gtk.Widget).activateAction("tab.close", null) != 0;
+            },
+        }
+    }
+
+    pub fn closeWindow(target: apprt.Target) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |core| {
+                const surface = core.rt_surface.surface;
+                return surface.as(gtk.Widget).activateAction("win.close", null) != 0;
+            },
         }
     }
 
@@ -1815,12 +1814,12 @@ const Action = struct {
 
             .surface => |core| {
                 const surface = core.rt_surface.surface;
-                return surface.as(gtk.Widget).activateAction(switch (direction) {
-                    .right => "split-tree.new-right",
-                    .left => "split-tree.new-left",
-                    .down => "split-tree.new-down",
-                    .up => "split-tree.new-up",
-                }, null) != 0;
+
+                return surface.as(gtk.Widget).activateAction(
+                    "split-tree.new-split",
+                    "&s",
+                    @tagName(direction).ptr,
+                ) != 0;
             },
         }
     }
@@ -2232,6 +2231,15 @@ const Action = struct {
             .app => return false,
             .surface => |surface| {
                 return surface.rt_surface.gobj().toggleCommandPalette();
+            },
+        }
+    }
+
+    pub fn controlInspector(target: apprt.Target, value: apprt.Action.Value(.inspector)) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().controlInspector(value);
             },
         }
     }
