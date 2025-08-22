@@ -2631,6 +2631,21 @@ keybind: Keybinds = .{},
 /// editor, etc.
 @"macos-titlebar-proxy-icon": MacTitlebarProxyIcon = .visible,
 
+/// Controls the windowing behavior when dropping a file or folder
+/// onto the Ghostty icon in the macOS dock.
+///
+/// Valid values are:
+///
+///   * `new-tab` - Create a new tab in the current window, or open
+///     a new window if none exist.
+///   * `new-window` - Create a new window unconditionally.
+///
+/// The default value is `new-tab`.
+///
+/// This setting is only supported on macOS and has no effect on other
+/// platforms.
+@"macos-dock-drop-behavior": MacOSDockDropBehavior = .@"new-tab",
+
 /// macOS doesn't have a distinct "alt" key and instead has the "option"
 /// key which behaves slightly differently. On macOS by default, the
 /// option key plus a character will sometimes produce a Unicode character.
@@ -2735,6 +2750,8 @@ keybind: Keybinds = .{},
 ///  * `blueprint`, `chalkboard`, `microchip`, `glass`, `holographic`,
 ///    `paper`, `retro`, `xray` - Official variants of the Ghostty icon
 ///    hand-created by artists (no AI).
+///  * `custom` - Use a completely custom icon. The location must be specified
+///    using the additional `macos-custom-icon` configuration
 ///  * `custom-style` - Use the official Ghostty icon but with custom
 ///    styles applied to various layers. The custom styles must be
 ///    specified using the additional `macos-icon`-prefixed configurations.
@@ -2752,6 +2769,15 @@ keybind: Keybinds = .{},
 ///     separate framework and cannot be customized without significant
 ///     effort.
 @"macos-icon": MacAppIcon = .official,
+
+/// The absolute path to the custom icon file.
+/// Supported formats include PNG, JPEG, and ICNS.
+///
+/// Defaults to `~/.config/ghostty/Ghostty.icns`
+///
+/// Note: This configuration is required when `macos-icon` is set to
+/// `custom`
+@"macos-custom-icon": ?[]const u8 = null,
 
 /// The material to use for the frame of the macOS app icon.
 ///
@@ -6975,6 +7001,7 @@ pub const MacAppIcon = enum {
     paper,
     retro,
     xray,
+    custom,
     @"custom-style",
 };
 
@@ -7068,6 +7095,12 @@ pub const WindowSaveState = enum {
 pub const WindowNewTabPosition = enum {
     current,
     end,
+};
+
+/// See macos-dock-drop-behavior
+pub const MacOSDockDropBehavior = enum {
+    @"new-tab",
+    window,
 };
 
 /// See window-show-tab-bar
