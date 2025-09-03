@@ -654,6 +654,18 @@ foreground: Color = .{ .r = 0xFF, .g = 0xFF, .b = 0xFF },
 /// Available since: 1.2.0
 @"selection-clear-on-typing": bool = true,
 
+/// Whether to clear selected text after copying. This defaults to `false`.
+///
+/// When set to `true`, the selection will be automatically cleared after
+/// any copy operation that invokes the `copy_to_clipboard` keyboard binding.
+/// Importantly, this will not clear the selection if the copy operation
+/// was invoked via `copy-on-select`.
+///
+/// When set to `false`, the selection remains visible after copying, allowing
+/// to see what was copied and potentially perform additional operations
+/// on the same selection.
+@"selection-clear-on-copy": bool = false,
+
 /// The minimum contrast ratio between the foreground and background colors.
 /// The contrast ratio is a value between 1 and 21. A value of 1 allows for no
 /// contrast (e.g. black on black). This value is the contrast ratio as defined
@@ -5785,15 +5797,24 @@ pub const Keybinds = struct {
             else
                 .{ .alt = true };
 
-            // Cmd+N for goto tab N
+            // Cmd/Alt+N for goto tab N
             const start: u21 = '1';
             const end: u21 = '8';
-            var i: u21 = start;
-            while (i <= end) : (i += 1) {
+            comptime var i: u21 = start;
+            inline while (i <= end) : (i += 1) {
+                // We register BOTH the physical `digit_N` key and the unicode
+                // `N` key. This allows most keyboard layouts to work with
+                // this shortcut. Namely, AZERTY doesn't produce unicode `N`
+                // for their digit keys (they're on shifted keys on the same
+                // physical keys).
+
                 try self.set.putFlags(
                     alloc,
                     .{
-                        .key = .{ .unicode = i },
+                        .key = .{ .physical = @field(
+                            inputpkg.Key,
+                            std.fmt.comptimePrint("digit_{u}", .{i}),
+                        ) },
                         .mods = mods,
                     },
                     .{ .goto_tab = (i - start) + 1 },
@@ -5803,6 +5824,22 @@ pub const Keybinds = struct {
                         // correct fix is to fix the reverse mapping lookup
                         // to allow us to lookup performable keybinds
                         // conditionally.
+                        .performable = !builtin.target.os.tag.isDarwin(),
+                    },
+                );
+
+                // Important: this must be the LAST binding set so that the
+                // libghostty trigger API returns this one for the action,
+                // so that things like the macOS tab bar key equivalent label
+                // work properly.
+                try self.set.putFlags(
+                    alloc,
+                    .{
+                        .key = .{ .unicode = i },
+                        .mods = mods,
+                    },
+                    .{ .goto_tab = (i - start) + 1 },
+                    .{
                         .performable = !builtin.target.os.tag.isDarwin(),
                     },
                 );
