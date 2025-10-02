@@ -2003,13 +2003,11 @@ pub const Surface = extern struct {
         const alloc = Application.default().allocator();
 
         if (ext.gValueHolds(value, gdk.FileList.getGObjectType())) {
-            var data = std.ArrayList(u8).init(alloc);
-            defer data.deinit();
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
 
-            var shell_escape_writer: internal_os.ShellEscapeWriter(std.ArrayList(u8).Writer) = .{
-                .child_writer = data.writer(),
-            };
-            const writer = shell_escape_writer.writer();
+            var shell_escape_writer: internal_os.ShellEscapeWriter = .init(&stream.writer);
+            const writer = &shell_escape_writer.writer;
 
             const list: ?*glib.SList = list: {
                 const unboxed = value.getBoxed() orelse return 0;
@@ -2037,7 +2035,7 @@ pub const Surface = extern struct {
                 }
             }
 
-            const string = data.toOwnedSliceSentinel(0) catch |err| {
+            const string = stream.toOwnedSliceSentinel(0) catch |err| {
                 log.err("unable to convert to a slice: {}", .{err});
                 return 0;
             };
@@ -2050,13 +2048,11 @@ pub const Surface = extern struct {
             const object = value.getObject() orelse return 0;
             const file = gobject.ext.cast(gio.File, object) orelse return 0;
             const path = file.getPath() orelse return 0;
-            var data = std.ArrayList(u8).init(alloc);
-            defer data.deinit();
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
 
-            var shell_escape_writer: internal_os.ShellEscapeWriter(std.ArrayList(u8).Writer) = .{
-                .child_writer = data.writer(),
-            };
-            const writer = shell_escape_writer.writer();
+            var shell_escape_writer: internal_os.ShellEscapeWriter = .init(&stream.writer);
+            const writer = &shell_escape_writer.writer;
             writer.writeAll(std.mem.span(path)) catch |err| {
                 log.err("unable to write path to buffer: {}", .{err});
                 return 0;
@@ -2066,7 +2062,7 @@ pub const Surface = extern struct {
                 return 0;
             };
 
-            const string = data.toOwnedSliceSentinel(0) catch |err| {
+            const string = stream.toOwnedSliceSentinel(0) catch |err| {
                 log.err("unable to convert to a slice: {}", .{err});
                 return 0;
             };
