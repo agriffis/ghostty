@@ -32,6 +32,7 @@ const TitleDialog = @import("surface_title_dialog.zig").SurfaceTitleDialog;
 const Window = @import("window.zig").Window;
 const WeakRef = @import("../weak_ref.zig").WeakRef;
 const InspectorWindow = @import("inspector_window.zig").InspectorWindow;
+const i18n = @import("../../../os/i18n.zig");
 
 const log = std.log.scoped(.gtk_ghostty_surface);
 
@@ -545,6 +546,8 @@ pub const Surface = extern struct {
         // unfocused-split-* options
         is_split: bool = false,
 
+        action_group: ?*gio.SimpleActionGroup = null,
+
         // Template binds
         child_exited_overlay: *ChildExited,
         context_menu: *gtk.PopoverMenu,
@@ -807,6 +810,65 @@ pub const Surface = extern struct {
             .{},
             null,
         );
+    }
+
+    pub fn commandFinished(self: *Self, value: apprt.Action.Value(.command_finished)) bool {
+        const app = Application.default();
+        const alloc = app.allocator();
+        const priv: *Private = self.private();
+
+        const notify_next_command_finish = notify: {
+            const simple_action_group = priv.action_group orelse break :notify false;
+            const action_group = simple_action_group.as(gio.ActionGroup);
+            const state = action_group.getActionState("notify-on-next-command-finish") orelse break :notify false;
+            const bool_variant_type = glib.ext.VariantType.newFor(bool);
+            defer bool_variant_type.free();
+            if (state.isOfType(bool_variant_type) == 0) break :notify false;
+            const notify = state.getBoolean() != 0;
+            action_group.changeActionState("notify-on-next-command-finish", glib.Variant.newBoolean(@intFromBool(false)));
+            break :notify notify;
+        };
+
+        const config = priv.config orelse return false;
+
+        const cfg = config.get();
+
+        if (!notify_next_command_finish) {
+            if (cfg.@"notify-on-command-finish" == .never) return true;
+            if (cfg.@"notify-on-command-finish" == .unfocused and self.getFocused()) return true;
+        }
+
+        const action = cfg.@"notify-on-command-finish-action";
+
+        if (action.bell) self.setBellRinging(true);
+
+        if (action.notify) notify: {
+            const title_ = title: {
+                const exit_code = value.exit_code orelse break :title i18n._("Command Finished");
+                if (exit_code == 0) break :title i18n._("Command Succeeded");
+                break :title i18n._("Command Failed");
+            };
+            const title = std.mem.span(title_);
+            const body = body: {
+                const exit_code = value.exit_code orelse break :body std.fmt.allocPrintSentinel(
+                    alloc,
+                    "Command took {f}.",
+                    .{value.duration.round(std.time.ns_per_ms)},
+                    0,
+                ) catch break :notify;
+                break :body std.fmt.allocPrintSentinel(
+                    alloc,
+                    "Command took {f} and exited with code {d}.",
+                    .{ value.duration.round(std.time.ns_per_ms), exit_code },
+                    0,
+                ) catch break :notify;
+            };
+            defer alloc.free(body);
+
+            self.sendDesktopNotification(title, body);
+        }
+
+        return true;
     }
 
     /// Key press event (press or release).
@@ -1315,11 +1377,11 @@ pub const Surface = extern struct {
         defer arena.deinit();
         const alloc = arena.allocator();
 
-        var env_to_remove = std.ArrayList([]const u8).init(alloc);
-        var env_to_update = std.ArrayList(struct {
+        var env_to_remove: std.ArrayList([]const u8) = .empty;
+        var env_to_update: std.ArrayList(struct {
             key: []const u8,
             value: []const u8,
-        }).init(alloc);
+        }) = .empty;
 
         var it = env_map.iterator();
         while (it.next()) |entry| {
@@ -1332,13 +1394,11 @@ pub const Surface = extern struct {
 
             // Any env var starting with SNAP must be removed
             if (std.mem.startsWith(u8, key, "SNAP_")) {
-                try env_to_remove.append(key);
+                try env_to_remove.append(alloc, key);
                 continue;
             }
 
-            var filtered_paths = std.ArrayList([]const u8).init(alloc);
-            defer filtered_paths.deinit();
-
+            var filtered_paths: std.ArrayList([]const u8) = .empty;
             var modified = false;
             var paths = std.mem.splitAny(u8, value, ":");
             while (paths.next()) |path| {
@@ -1351,15 +1411,15 @@ pub const Surface = extern struct {
                         break;
                     }
                 };
-                if (include) try filtered_paths.append(path);
+                if (include) try filtered_paths.append(alloc, path);
             }
 
             if (modified) {
                 if (filtered_paths.items.len > 0) {
                     const new_value = try std.mem.join(alloc, ":", filtered_paths.items);
-                    try env_to_update.append(.{ .key = key, .value = new_value });
+                    try env_to_update.append(alloc, .{ .key = key, .value = new_value });
                 } else {
-                    try env_to_remove.append(key);
+                    try env_to_remove.append(alloc, key);
                 }
             }
         }
@@ -1402,6 +1462,34 @@ pub const Surface = extern struct {
     pub fn grabFocus(self: *Self) void {
         const priv = self.private();
         _ = priv.gl_area.as(gtk.Widget).grabFocus();
+    }
+
+    pub fn sendDesktopNotification(self: *Self, title: [:0]const u8, body: [:0]const u8) void {
+        const app = Application.default();
+
+        const t = switch (title.len) {
+            0 => "Ghostty",
+            else => title,
+        };
+
+        const notification = gio.Notification.new(t);
+        defer notification.unref();
+        notification.setBody(body);
+
+        const icon = gio.ThemedIcon.new("com.mitchellh.ghostty");
+        defer icon.unref();
+        notification.setIcon(icon.as(gio.Icon));
+
+        const pointer = glib.Variant.newUint64(@intFromPtr(self));
+        notification.setDefaultActionAndTargetValue(
+            "app.present-surface",
+            pointer,
+        );
+
+        // We set the notification ID to the body content. If the content is the
+        // same, this notification may replace a previous notification
+        const gio_app = app.as(gio.Application);
+        gio_app.sendNotification(body, notification);
     }
 
     //---------------------------------------------------------------
@@ -1460,11 +1548,23 @@ pub const Surface = extern struct {
     }
 
     fn initActionMap(self: *Self) void {
+        const priv: *Private = self.private();
+
         const actions = [_]ext.actions.Action(Self){
-            .init("prompt-title", actionPromptTitle, null),
+            .init(
+                "prompt-title",
+                actionPromptTitle,
+                null,
+            ),
+            .initStateful(
+                "notify-on-next-command-finish",
+                actionNotifyOnNextCommandFinish,
+                null,
+                glib.Variant.newBoolean(@intFromBool(false)),
+            ),
         };
 
-        ext.actions.addAsGroup(Self, self, "surface", &actions);
+        priv.action_group = ext.actions.addAsGroup(Self, self, "surface", &actions);
     }
 
     fn dispose(self: *Self) callconv(.c) void {
@@ -1526,7 +1626,7 @@ pub const Surface = extern struct {
             priv.core_surface = null;
         }
         if (priv.mouse_hover_url) |v| {
-            glib.free(@constCast(@ptrCast(v)));
+            glib.free(@ptrCast(@constCast(v)));
             priv.mouse_hover_url = null;
         }
         if (priv.default_size) |v| {
@@ -1542,15 +1642,15 @@ pub const Surface = extern struct {
             priv.min_size = null;
         }
         if (priv.pwd) |v| {
-            glib.free(@constCast(@ptrCast(v)));
+            glib.free(@ptrCast(@constCast(v)));
             priv.pwd = null;
         }
         if (priv.title) |v| {
-            glib.free(@constCast(@ptrCast(v)));
+            glib.free(@ptrCast(@constCast(v)));
             priv.title = null;
         }
         if (priv.title_override) |v| {
-            glib.free(@constCast(@ptrCast(v)));
+            glib.free(@ptrCast(@constCast(v)));
             priv.title_override = null;
         }
         self.clearCgroup();
@@ -1574,7 +1674,7 @@ pub const Surface = extern struct {
     /// title. For manually set titles see `setTitleOverride`.
     pub fn setTitle(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
-        if (priv.title) |v| glib.free(@constCast(@ptrCast(v)));
+        if (priv.title) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title = null;
         if (title) |v| priv.title = glib.ext.dupeZ(u8, v);
         self.as(gobject.Object).notifyByPspec(properties.title.impl.param_spec);
@@ -1584,7 +1684,7 @@ pub const Surface = extern struct {
     /// unless this is unset (null).
     pub fn setTitleOverride(self: *Self, title: ?[:0]const u8) void {
         const priv = self.private();
-        if (priv.title_override) |v| glib.free(@constCast(@ptrCast(v)));
+        if (priv.title_override) |v| glib.free(@ptrCast(@constCast(v)));
         priv.title_override = null;
         if (title) |v| priv.title_override = glib.ext.dupeZ(u8, v);
         self.as(gobject.Object).notifyByPspec(properties.@"title-override".impl.param_spec);
@@ -1598,7 +1698,7 @@ pub const Surface = extern struct {
     /// Set the pwd for this surface, copies the value.
     pub fn setPwd(self: *Self, pwd: ?[:0]const u8) void {
         const priv = self.private();
-        if (priv.pwd) |v| glib.free(@constCast(@ptrCast(v)));
+        if (priv.pwd) |v| glib.free(@ptrCast(@constCast(v)));
         priv.pwd = null;
         if (pwd) |v| priv.pwd = glib.ext.dupeZ(u8, v);
         self.as(gobject.Object).notifyByPspec(properties.pwd.impl.param_spec);
@@ -1683,7 +1783,7 @@ pub const Surface = extern struct {
 
     pub fn setMouseHoverUrl(self: *Self, url: ?[:0]const u8) void {
         const priv = self.private();
-        if (priv.mouse_hover_url) |v| glib.free(@constCast(@ptrCast(v)));
+        if (priv.mouse_hover_url) |v| glib.free(@ptrCast(@constCast(v)));
         priv.mouse_hover_url = null;
         if (url) |v| priv.mouse_hover_url = glib.ext.dupeZ(u8, v);
         self.as(gobject.Object).notifyByPspec(properties.@"mouse-hover-url".impl.param_spec);
@@ -1966,6 +2066,20 @@ pub const Surface = extern struct {
         };
     }
 
+    pub fn actionNotifyOnNextCommandFinish(
+        action: *gio.SimpleAction,
+        _: ?*glib.Variant,
+        _: *Self,
+    ) callconv(.c) void {
+        const state = action.as(gio.Action).getState() orelse glib.Variant.newBoolean(@intFromBool(false));
+        defer state.unref();
+        const bool_variant_type = glib.ext.VariantType.newFor(bool);
+        defer bool_variant_type.free();
+        if (state.isOfType(bool_variant_type) == 0) return;
+        const value = state.getBoolean() != 0;
+        action.setState(glib.Variant.newBoolean(@intFromBool(!value)));
+    }
+
     fn childExitedClose(
         _: *ChildExited,
         self: *Self,
@@ -2003,13 +2117,11 @@ pub const Surface = extern struct {
         const alloc = Application.default().allocator();
 
         if (ext.gValueHolds(value, gdk.FileList.getGObjectType())) {
-            var data = std.ArrayList(u8).init(alloc);
-            defer data.deinit();
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
 
-            var shell_escape_writer: internal_os.ShellEscapeWriter(std.ArrayList(u8).Writer) = .{
-                .child_writer = data.writer(),
-            };
-            const writer = shell_escape_writer.writer();
+            var shell_escape_writer: internal_os.ShellEscapeWriter = .init(&stream.writer);
+            const writer = &shell_escape_writer.writer;
 
             const list: ?*glib.SList = list: {
                 const unboxed = value.getBoxed() orelse return 0;
@@ -2037,7 +2149,7 @@ pub const Surface = extern struct {
                 }
             }
 
-            const string = data.toOwnedSliceSentinel(0) catch |err| {
+            const string = stream.toOwnedSliceSentinel(0) catch |err| {
                 log.err("unable to convert to a slice: {}", .{err});
                 return 0;
             };
@@ -2050,13 +2162,11 @@ pub const Surface = extern struct {
             const object = value.getObject() orelse return 0;
             const file = gobject.ext.cast(gio.File, object) orelse return 0;
             const path = file.getPath() orelse return 0;
-            var data = std.ArrayList(u8).init(alloc);
-            defer data.deinit();
+            var stream: std.Io.Writer.Allocating = .init(alloc);
+            defer stream.deinit();
 
-            var shell_escape_writer: internal_os.ShellEscapeWriter(std.ArrayList(u8).Writer) = .{
-                .child_writer = data.writer(),
-            };
-            const writer = shell_escape_writer.writer();
+            var shell_escape_writer: internal_os.ShellEscapeWriter = .init(&stream.writer);
+            const writer = &shell_escape_writer.writer;
             writer.writeAll(std.mem.span(path)) catch |err| {
                 log.err("unable to write path to buffer: {}", .{err});
                 return 0;
@@ -2066,7 +2176,7 @@ pub const Surface = extern struct {
                 return 0;
             };
 
-            const string = data.toOwnedSliceSentinel(0) catch |err| {
+            const string = stream.toOwnedSliceSentinel(0) catch |err| {
                 log.err("unable to convert to a slice: {}", .{err});
                 return 0;
             };

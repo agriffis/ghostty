@@ -33,6 +33,7 @@ const font = @import("font/main.zig");
 const Command = @import("Command.zig");
 const terminal = @import("terminal/main.zig");
 const configpkg = @import("config.zig");
+const Duration = configpkg.Config.Duration;
 const input = @import("input.zig");
 const App = @import("App.zig");
 const internal_os = @import("os/main.zig");
@@ -146,6 +147,13 @@ focused: bool = true,
 
 /// Used to determine whether to continuously scroll.
 selection_scroll_active: bool = false,
+
+/// Used to send notifications that long running commands have finished.
+/// Requires that shell integration be active. Should represent a nanosecond
+/// precision timestamp. It does not necessarily need to correspond to the
+/// actual time, but we must be able to compare two subsequent timestamps to get
+/// the wall clock time that has elapsed between timestamps.
+command_timer: ?std.time.Instant = null,
 
 /// The effect of an input event. This can be used by callers to take
 /// the appropriate action after an input event. For example, key
@@ -280,6 +288,9 @@ const DerivedConfig = struct {
     links: []Link,
     link_previews: configpkg.LinkPreviews,
     scroll_to_bottom: configpkg.Config.ScrollToBottom,
+    notify_on_command_finish: configpkg.Config.NotifyOnCommandFinish,
+    notify_on_command_finish_action: configpkg.Config.NotifyOnCommandFinishAction,
+    notify_on_command_finish_after: Duration,
 
     const Link = struct {
         regex: oni.Regex,
@@ -294,19 +305,19 @@ const DerivedConfig = struct {
 
         // Build all of our links
         const links = links: {
-            var links = std.ArrayList(Link).init(alloc);
-            defer links.deinit();
+            var links: std.ArrayList(Link) = .empty;
+            defer links.deinit(alloc);
             for (config.link.links.items) |link| {
                 var regex = try link.oniRegex();
                 errdefer regex.deinit();
-                try links.append(.{
+                try links.append(alloc, .{
                     .regex = regex,
                     .action = link.action,
                     .highlight = link.highlight,
                 });
             }
 
-            break :links try links.toOwnedSlice();
+            break :links try links.toOwnedSlice(alloc);
         };
         errdefer {
             for (links) |*link| link.regex.deinit();
@@ -350,6 +361,9 @@ const DerivedConfig = struct {
             .links = links,
             .link_previews = config.@"link-previews",
             .scroll_to_bottom = config.@"scroll-to-bottom",
+            .notify_on_command_finish = config.@"notify-on-command-finish",
+            .notify_on_command_finish_action = config.@"notify-on-command-finish-action",
+            .notify_on_command_finish_after = config.@"notify-on-command-finish-after",
 
             // Assignments happen sequentially so we have to do this last
             // so that the memory is captured from allocs above.
@@ -983,6 +997,30 @@ pub fn handleMessage(self: *Surface, msg: Message) !void {
         .selection_scroll_tick => |active| {
             self.selection_scroll_active = active;
             try self.selectionScrollTick();
+        },
+
+        .start_command => {
+            self.command_timer = try .now();
+        },
+
+        .stop_command => |v| timer: {
+            const end: std.time.Instant = try .now();
+            const start = self.command_timer orelse break :timer;
+            self.command_timer = null;
+
+            const duration: Duration = .{ .duration = end.since(start) };
+            log.debug("command took {f}", .{duration});
+
+            _ = self.rt_app.performAction(
+                .{ .surface = self },
+                .command_finished,
+                .{
+                    .exit_code = v,
+                    .duration = duration,
+                },
+            ) catch |err| {
+                log.warn("apprt failed to notify command finish={}", .{err});
+            };
         },
     }
 }
@@ -2455,7 +2493,7 @@ fn maybeHandleBinding(
     self.keyboard.bindings = null;
 
     // Attempt to perform the action
-    log.debug("key event binding flags={} action={}", .{
+    log.debug("key event binding flags={} action={f}", .{
         leaf.flags,
         action,
     });
@@ -3960,6 +3998,8 @@ pub fn cursorPosCallback(
     crash.sentry.thread_state = self.crashThreadState();
     defer crash.sentry.thread_state = null;
 
+    // log.debug("cursor pos x={} y={} mods={?}", .{ pos.x, pos.y, mods });
+
     // If the position is negative, it is outside our viewport and
     // we need to clear any hover states.
     if (pos.x < 0 or pos.y < 0) {
@@ -5081,7 +5121,9 @@ fn writeScreenFile(
     defer file.close();
 
     // Screen.dumpString writes byte-by-byte, so buffer it
-    var buf_writer = std.io.bufferedWriter(file.writer());
+    var buf: [4096]u8 = undefined;
+    var file_writer = file.writer(&buf);
+    var buf_writer = &file_writer.interface;
 
     // Write the scrollback contents. This requires a lock.
     {
@@ -5131,7 +5173,7 @@ fn writeScreenFile(
         const br = sel.bottomRight(&self.io.terminal.screen);
 
         try self.io.terminal.screen.dumpString(
-            buf_writer.writer(),
+            buf_writer,
             .{
                 .tl = tl,
                 .br = br,

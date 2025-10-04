@@ -429,8 +429,19 @@ pub const Face = struct {
         try self.face.loadGlyph(glyph_index, self.glyphLoadFlags(opts.constraint.doesAnything()));
         const glyph = self.face.handle.*.glyph;
 
+        // For synthetic bold, we embolden the glyph.
+        if (self.synthetic.bold) {
+            // We need to scale the embolden amount based on the font size.
+            // This is a heuristic I found worked well across a variety of
+            // founts: 1 pixel per 64 units of height.
+            const font_height: f64 = @floatFromInt(self.face.handle.*.size.*.metrics.height);
+            const ratio: f64 = 64.0 / 2048.0;
+            const amount = @ceil(font_height * ratio);
+            _ = freetype.c.FT_Outline_Embolden(&glyph.*.outline, @intFromFloat(amount));
+        }
+
         // We get a rect that represents the position
-        // and size of the glyph before any changes.
+        // and size of the glyph before constraints.
         const rect = getGlyphSize(glyph);
 
         // If our glyph is smaller than a quarter pixel in either axis
@@ -447,30 +458,12 @@ pub const Face = struct {
                 .atlas_y = 0,
             };
 
-        // For synthetic bold, we embolden the glyph.
-        if (self.synthetic.bold) {
-            // We need to scale the embolden amount based on the font size.
-            // This is a heuristic I found worked well across a variety of
-            // founts: 1 pixel per 64 units of height.
-            const font_height: f64 = @floatFromInt(self.face.handle.*.size.*.metrics.height);
-            const ratio: f64 = 64.0 / 2048.0;
-            const amount = @ceil(font_height * ratio);
-            _ = freetype.c.FT_Outline_Embolden(&glyph.*.outline, @intFromFloat(amount));
-        }
-
         const metrics = opts.grid_metrics;
         const cell_width: f64 = @floatFromInt(metrics.cell_width);
         const cell_height: f64 = @floatFromInt(metrics.cell_height);
 
         // Next we apply any constraints to get the final size of the glyph.
-        var constraint = opts.constraint;
-
-        // We eliminate any negative vertical padding since these overlap
-        // values aren't needed  with how precisely we apply constraints,
-        // and they can lead to extra height that looks bad for things like
-        // powerline glyphs.
-        constraint.pad_top = @max(0.0, constraint.pad_top);
-        constraint.pad_bottom = @max(0.0, constraint.pad_bottom);
+        const constraint = opts.constraint;
 
         // We need to add the baseline position before passing to the constrain
         // function since it operates on cell-relative positions, not baseline.
@@ -492,24 +485,14 @@ pub const Face = struct {
         var x = glyph_size.x;
         var y = glyph_size.y;
 
-        // If this is a bitmap glyph, it will always render as full pixels,
-        // not fractional pixels, so we need to quantize its position and
-        // size accordingly to align to full pixels so we get good results.
-        if (glyph.*.format == freetype.c.FT_GLYPH_FORMAT_BITMAP) {
-            width = cell_width - @round(cell_width - width - x) - @round(x);
-            height = cell_height - @round(cell_height - height - y) - @round(y);
-            x = @round(x);
-            y = @round(y);
-        }
-
         // We center all glyphs within the pixel-rounded and adjusted
         // cell width if it's larger than the face width, so that they
         // aren't weirdly off to the left.
         //
-        // We don't do this if the constraint has a horizontal alignment,
+        // We don't do this if the glyph has a stretch constraint,
         // since in that case the position was already calculated with the
         // new cell width in mind.
-        if ((opts.constraint.align_horizontal == .none) and (metrics.face_width < cell_width)) {
+        if ((constraint.size != .stretch) and (metrics.face_width < cell_width)) {
             // We add half the difference to re-center.
             //
             // NOTE: We round this to a whole-pixel amount because under
@@ -518,6 +501,16 @@ pub const Face = struct {
             //       a non-whole-pixel amount, it completely ruins the
             //       hinting.
             x += @round((cell_width - metrics.face_width) / 2);
+        }
+
+        // If this is a bitmap glyph, it will always render as full pixels,
+        // not fractional pixels, so we need to quantize its position and
+        // size accordingly to align to full pixels so we get good results.
+        if (glyph.*.format == freetype.c.FT_GLYPH_FORMAT_BITMAP) {
+            width = cell_width - @round(cell_width - width - x) - @round(x);
+            height = cell_height - @round(cell_height - height - y) - @round(y);
+            x = @round(x);
+            y = @round(y);
         }
 
         // Now we can render the glyph.

@@ -713,6 +713,7 @@ pub const Application = extern struct {
             .toggle_command_palette => return Action.toggleCommandPalette(target),
             .toggle_split_zoom => return Action.toggleSplitZoom(target),
             .show_on_screen_keyboard => return Action.showOnScreenKeyboard(target),
+            .command_finished => return Action.commandFinished(target, value),
 
             // Unimplemented
             .secure_input,
@@ -1043,7 +1044,9 @@ pub const Application = extern struct {
             defer file.close();
 
             log.info("loading gtk-custom-css path={s}", .{path});
-            const contents = try file.reader().readAllAlloc(
+            var buf: [4096]u8 = undefined;
+            var reader = file.reader(&buf);
+            const contents = try reader.interface.readAlloc(
                 alloc,
                 5 * 1024 * 1024, // 5MB,
             );
@@ -1114,8 +1117,8 @@ pub const Application = extern struct {
             // This should really never, never happen. Its not critical enough
             // to actually crash, but this is a bug somewhere. An accelerator
             // for a trigger can't possibly be more than 1024 bytes.
-            error.NoSpaceLeft => {
-                log.warn("accelerator somehow longer than 1024 bytes: {}", .{trigger});
+            error.WriteFailed => {
+                log.warn("accelerator somehow longer than 1024 bytes: {f}", .{trigger});
                 return;
             },
         };
@@ -1824,13 +1827,13 @@ const Action = struct {
         target: apprt.Target,
         n: apprt.action.DesktopNotification,
     ) void {
-        // TODO: We should move the surface target to a function call
-        // on Surface and emit a signal that embedders can connect to. This
-        // will let us handle notifications differently depending on where
-        // a surface is presented. At the time of writing this, we always
-        // want to show the notification AND the logic below was directly
-        // ported from "legacy" GTK so this is fine, but I want to leave this
-        // note so we can do it one day.
+        switch (target) {
+            .app => {},
+            .surface => |v| {
+                v.rt_surface.gobj().sendDesktopNotification(n.title, n.body);
+                return;
+            },
+        }
 
         // Set a default title if we don't already have one
         const t = switch (n.title.len) {
@@ -1845,14 +1848,9 @@ const Action = struct {
         const icon = gio.ThemedIcon.new("com.mitchellh.ghostty");
         defer icon.unref();
         notification.setIcon(icon.as(gio.Icon));
-
-        const pointer = glib.Variant.newUint64(switch (target) {
-            .app => 0,
-            .surface => |v| @intFromPtr(v),
-        });
         notification.setDefaultActionAndTargetValue(
             "app.present-surface",
-            pointer,
+            glib.Variant.newUint64(0),
         );
 
         // We set the notification ID to the body content. If the content is the
@@ -2454,6 +2452,15 @@ const Action = struct {
             .app => return false,
             .surface => |surface| {
                 return surface.rt_surface.gobj().controlInspector(value);
+            },
+        }
+    }
+
+    pub fn commandFinished(target: apprt.Target, value: apprt.Action.Value(.command_finished)) bool {
+        switch (target) {
+            .app => return false,
+            .surface => |surface| {
+                return surface.rt_surface.gobj().commandFinished(value);
             },
         }
     }
