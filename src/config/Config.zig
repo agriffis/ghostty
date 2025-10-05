@@ -2861,7 +2861,7 @@ keybind: Keybinds = .{},
 ///
 /// The values `left` or `right` enable this for the left or right *Option*
 /// key, respectively.
-@"macos-option-as-alt": ?OptionAsAlt = null,
+@"macos-option-as-alt": ?inputpkg.OptionAsAlt = null,
 
 /// Whether to enable the macOS window shadow. The default value is true.
 /// With some window managers and window transparency settings, you may
@@ -2957,9 +2957,6 @@ keybind: Keybinds = .{},
 /// Supported formats include PNG, JPEG, and ICNS.
 ///
 /// Defaults to `~/.config/ghostty/Ghostty.icns`
-///
-/// Note: This configuration is required when `macos-icon` is set to
-/// `custom`
 @"macos-custom-icon": ?[:0]const u8 = null,
 
 /// The material to use for the frame of the macOS app icon.
@@ -4822,14 +4819,6 @@ pub const NonNativeFullscreen = enum(c_int) {
     true,
     @"visible-menu",
     @"padded-notch",
-};
-
-/// Valid values for macos-option-as-alt.
-pub const OptionAsAlt = enum {
-    false,
-    true,
-    left,
-    right,
 };
 
 pub const WindowPaddingColor = enum {

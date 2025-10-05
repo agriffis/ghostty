@@ -271,7 +271,7 @@ const DerivedConfig = struct {
     mouse_scroll_multiplier: configpkg.MouseScrollMultiplier,
     mouse_shift_capture: configpkg.MouseShiftCapture,
     macos_non_native_fullscreen: configpkg.NonNativeFullscreen,
-    macos_option_as_alt: ?configpkg.OptionAsAlt,
+    macos_option_as_alt: ?input.OptionAsAlt,
     selection_clear_on_copy: bool,
     selection_clear_on_typing: bool,
     vt_kam_allowed: bool,
@@ -1130,7 +1130,7 @@ fn childExited(self: *Surface, info: apprt.surface.Message.ChildExited) void {
         // so that we can close the terminal. We close the terminal on
         // any key press that encodes a character.
         t.modes.set(.disable_keyboard, false);
-        t.screen.kitty_keyboard.set(.set, .{});
+        t.screen.kitty_keyboard.set(.set, .disabled);
     }
 
     // Waiting after command we stop here. The terminal is updated, our
@@ -2611,56 +2611,32 @@ fn encodeKey(
     event: input.KeyEvent,
     insp_ev: ?*inspectorpkg.key.Event,
 ) !?termio.Message.WriteReq {
-    // Build up our encoder. Under different modes and
-    // inputs there are many keybindings that result in no encoding
-    // whatsoever.
-    const enc: input.KeyEncoder = enc: {
-        const option_as_alt: configpkg.OptionAsAlt = self.config.macos_option_as_alt orelse detect: {
-            // Non-macOS doesn't use this value so ignore.
-            if (comptime builtin.os.tag != .macos) break :detect .false;
-
-            // If we don't have alt pressed, it doesn't matter what this
-            // config is so we can just say "false" and break out and avoid
-            // more expensive checks below.
-            if (!event.mods.alt) break :detect .false;
-
-            // Alt is pressed, we're on macOS. We break some encapsulation
-            // here and assume libghostty for ease...
-            break :detect self.rt_app.keyboardLayout().detectOptionAsAlt();
-        };
-
-        self.renderer_state.mutex.lock();
-        defer self.renderer_state.mutex.unlock();
-        const t = &self.io.terminal;
-        break :enc .{
-            .event = event,
-            .macos_option_as_alt = option_as_alt,
-            .alt_esc_prefix = t.modes.get(.alt_esc_prefix),
-            .cursor_key_application = t.modes.get(.cursor_keys),
-            .keypad_key_application = t.modes.get(.keypad_keys),
-            .ignore_keypad_with_numlock = t.modes.get(.ignore_keypad_with_numlock),
-            .modify_other_keys_state_2 = t.flags.modify_other_keys_2,
-            .kitty_flags = t.screen.kitty_keyboard.current(),
-        };
-    };
-
     const write_req: termio.Message.WriteReq = req: {
+        // Build our encoding options, which requires the lock.
+        const encoding_opts = self.encodeKeyOpts();
+
         // Try to write the input into a small array. This fits almost
         // every scenario. Larger situations can happen due to long
         // pre-edits.
         var data: termio.Message.WriteReq.Small.Array = undefined;
-        if (enc.encode(&data)) |seq| {
+        var writer: std.Io.Writer = .fixed(&data);
+        if (input.key_encode.encode(
+            &writer,
+            event,
+            encoding_opts,
+        )) {
+            const written = writer.buffered();
+
             // Special-case: we did nothing.
-            if (seq.len == 0) return null;
+            if (written.len == 0) return null;
 
             break :req .{ .small = .{
                 .data = data,
-                .len = @intCast(seq.len),
+                .len = @intCast(written.len),
             } };
         } else |err| switch (err) {
             // Means we need to allocate
-            error.OutOfMemory => {},
-            else => return err,
+            error.WriteFailed => {},
         }
 
         // We need to allocate. We allocate double the UTF-8 length
@@ -2669,16 +2645,23 @@ fn encodeKey(
         // typing this where we don't have enough space is a long preedit,
         // and in that case the size we need is exactly the UTF-8 length,
         // so the double is being safe.
-        const buf = try self.alloc.alloc(u8, @max(
-            event.utf8.len * 2,
-            data.len * 2,
-        ));
-        defer self.alloc.free(buf);
+        var alloc_writer: std.Io.Writer.Allocating = try .initCapacity(
+            self.alloc,
+            @max(event.utf8.len * 2, data.len * 2),
+        );
+        defer alloc_writer.deinit();
 
         // This results in a double allocation but this is such an unlikely
         // path the performance impact is unimportant.
-        const seq = try enc.encode(buf);
-        break :req try termio.Message.WriteReq.init(self.alloc, seq);
+        try input.key_encode.encode(
+            &alloc_writer.writer,
+            event,
+            encoding_opts,
+        );
+        break :req try termio.Message.WriteReq.init(
+            self.alloc,
+            alloc_writer.writer.buffered(),
+        );
     };
 
     // Copy the encoded data into the inspector event if we have one.
@@ -2696,6 +2679,28 @@ fn encodeKey(
     }
 
     return write_req;
+}
+
+fn encodeKeyOpts(self: *const Surface) input.key_encode.Options {
+    self.renderer_state.mutex.lock();
+    defer self.renderer_state.mutex.unlock();
+    const t = &self.io.terminal;
+
+    var opts: input.key_encode.Options = .fromTerminal(t);
+    if (comptime builtin.os.tag != .macos) return opts;
+
+    opts.macos_option_as_alt = self.config.macos_option_as_alt orelse detect: {
+        // If we don't have alt pressed, it doesn't matter what this
+        // config is so we can just say "false" and break out and avoid
+        // more expensive checks below.
+        if (!self.mouse.mods.alt) break :detect .false;
+
+        // Alt is pressed, we're on macOS. We break some encapsulation
+        // here and assume libghostty for ease...
+        break :detect self.rt_app.keyboardLayout().detectOptionAsAlt();
+    };
+
+    return opts;
 }
 
 /// Sends text as-is to the terminal without triggering any keyboard
@@ -5270,13 +5275,10 @@ fn completeClipboardPaste(
 ) !void {
     if (data.len == 0) return;
 
-    const critical: struct {
-        bracketed: bool,
-    } = critical: {
+    const encode_opts: input.paste.Options = encode_opts: {
         self.renderer_state.mutex.lock();
         defer self.renderer_state.mutex.unlock();
-
-        const bracketed = self.io.terminal.modes.get(.bracketed_paste);
+        const opts: input.paste.Options = .fromTerminal(&self.io.terminal);
 
         // If we have paste protection enabled, we detect unsafe pastes and return
         // an error. The error approach allows apprt to attempt to complete the paste
@@ -5292,7 +5294,7 @@ fn completeClipboardPaste(
             // This is set during confirmation usually.
             if (allow_unsafe) break :unsafe false;
 
-            if (bracketed) {
+            if (opts.bracketed) {
                 // If we're bracketed and the paste contains and ending
                 // bracket then something naughty might be going on and we
                 // never trust it.
@@ -5303,7 +5305,7 @@ fn completeClipboardPaste(
                 if (self.config.clipboard_paste_bracketed_safe) break :unsafe false;
             }
 
-            break :unsafe !terminal.isSafePaste(data);
+            break :unsafe !input.paste.isSafe(data);
         };
 
         if (unsafe) {
@@ -5317,55 +5319,32 @@ fn completeClipboardPaste(
             log.warn("error scrolling to bottom err={}", .{err});
         };
 
-        break :critical .{
-            .bracketed = bracketed,
-        };
+        break :encode_opts opts;
     };
 
-    if (critical.bracketed) {
-        // If we're bracketd we write the data as-is to the terminal with
-        // the bracketed paste escape codes around it.
-        self.io.queueMessage(.{
-            .write_stable = "\x1B[200~",
-        }, .unlocked);
+    // Encode the data. In most cases this doesn't require any
+    // copies, so we optimize for that case.
+    var data_duped: ?[]u8 = null;
+    const vecs = input.paste.encode(data, encode_opts) catch |err| switch (err) {
+        error.MutableRequired => vecs: {
+            const buf: []u8 = try self.alloc.dupe(u8, data);
+            errdefer self.alloc.free(buf);
+            data_duped = buf;
+            break :vecs input.paste.encode(buf, encode_opts);
+        },
+    };
+    defer if (data_duped) |v| {
+        // This code path means the data did require a copy and mutation.
+        // We must free it.
+        self.alloc.free(v);
+    };
+
+    for (vecs) |vec| if (vec.len > 0) {
         self.io.queueMessage(try termio.Message.writeReq(
             self.alloc,
-            data,
+            vec,
         ), .unlocked);
-        self.io.queueMessage(.{
-            .write_stable = "\x1B[201~",
-        }, .unlocked);
-    } else {
-        // If its not bracketed the input bytes are indistinguishable from
-        // keystrokes, so we must be careful. For example, we must replace
-        // any newlines with '\r'.
-
-        // We just do a heap allocation here because its easy and I don't think
-        // worth the optimization of using small messages.
-        var buf = try self.alloc.alloc(u8, data.len);
-        defer self.alloc.free(buf);
-
-        // This is super, super suboptimal. We can easily make use of SIMD
-        // here, but maybe LLVM in release mode is smart enough to figure
-        // out something clever. Either way, large non-bracketed pastes are
-        // increasingly rare for modern applications.
-        var len: usize = 0;
-        for (data, 0..) |ch, i| {
-            const dch = switch (ch) {
-                '\n' => '\r',
-                '\r' => if (i + 1 < data.len and data[i + 1] == '\n') continue else ch,
-                else => ch,
-            };
-
-            buf[len] = dch;
-            len += 1;
-        }
-
-        self.io.queueMessage(try termio.Message.writeReq(
-            self.alloc,
-            buf[0..len],
-        ), .unlocked);
-    }
+    };
 }
 
 fn completeClipboardReadOSC52(
