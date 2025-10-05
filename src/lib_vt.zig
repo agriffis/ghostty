@@ -102,6 +102,10 @@ comptime {
         @export(&c.osc_end, .{ .name = "ghostty_osc_end" });
         @export(&c.osc_command_type, .{ .name = "ghostty_osc_command_type" });
         @export(&c.osc_command_data, .{ .name = "ghostty_osc_command_data" });
+        @export(&c.key_event_new, .{ .name = "ghostty_key_event_new" });
+        @export(&c.key_event_free, .{ .name = "ghostty_key_event_free" });
+        @export(&c.key_event_set, .{ .name = "ghostty_key_event_set" });
+        @export(&c.key_event_get, .{ .name = "ghostty_key_event_get" });
     }
 }
 
