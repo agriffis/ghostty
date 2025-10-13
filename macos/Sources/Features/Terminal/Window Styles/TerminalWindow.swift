@@ -159,6 +159,12 @@ class TerminalWindow: NSWindow {
         } else {
             tabBarDidDisappear()
         }
+        viewModel.isMainWindow = true
+    }
+
+    override func resignMain() {
+        super.resignMain()
+        viewModel.isMainWindow = false
     }
 
     override func mergeAllWindows(_ sender: Any?) {
@@ -199,7 +205,14 @@ class TerminalWindow: NSWindow {
 
     /// Returns true if there is a tab bar visible on this window.
     var hasTabBar: Bool {
+        // TODO: use titlebarView to find it instead
         contentView?.firstViewFromRoot(withClassName: "NSTabBar") != nil
+    }
+
+    var hasMoreThanOneTabs: Bool {
+        /// accessing ``tabGroup?.windows`` here
+        /// will cause other edge cases, be careful
+        (tabbedWindows?.count ?? 0) > 1
     }
 
     func isTabBar(_ childViewController: NSTitlebarAccessoryViewController) -> Bool {
@@ -298,7 +311,7 @@ class TerminalWindow: NSWindow {
         button.isBordered = false
         button.allowsExpansionToolTips = true
         button.toolTip = "Reset Zoom"
-        button.contentTintColor = .controlAccentColor
+        button.contentTintColor = isMainWindow ? .controlAccentColor : .secondaryLabelColor
         button.state = .on
         button.image = NSImage(named:"ResetZoom")
         button.frame = NSRect(x: 0, y: 0, width: 20, height: 20)
@@ -315,6 +328,12 @@ class TerminalWindow: NSWindow {
             // Whenever we change the window title we must also update our
             // tab title if we're using custom fonts.
             tab.attributedTitle = attributedTitle
+            /// We also needs to update this here, just in case
+            /// the value is not what we want
+            ///
+            /// Check ``titlebarFont`` down below
+            /// to see why we need to check `hasMoreThanOneTabs` here
+            titlebarTextField?.usesSingleLineMode = !hasMoreThanOneTabs
         }
     }
 
@@ -324,6 +343,12 @@ class TerminalWindow: NSWindow {
             let font = titlebarFont ?? NSFont.titleBarFont(ofSize: NSFont.systemFontSize)
 
             titlebarTextField?.font = font
+            /// We check `hasMoreThanOneTabs` here because the system
+            /// may copy this setting to the tab’s text field at some point(e.g. entering/exiting fullscreen),
+            /// which can cause the title to be vertically misaligned (shifted downward).
+            ///
+            /// This behaviour is the opposite of what happens in the title bar’s text field, which is quite odd...
+            titlebarTextField?.usesSingleLineMode = !hasMoreThanOneTabs
             tab.attributedTitle = attributedTitle
         }
     }
@@ -505,7 +530,8 @@ extension TerminalWindow {
     class ViewModel: ObservableObject {
         @Published var isSurfaceZoomed: Bool = false
         @Published var hasToolbar: Bool = false
-        
+        @Published var isMainWindow: Bool = true
+
         /// Calculates the top padding based on toolbar visibility and macOS version
         fileprivate var accessoryTopPadding: CGFloat {
             if #available(macOS 26.0, *) {
@@ -525,7 +551,7 @@ extension TerminalWindow {
                 VStack {
                     Button(action: action) {
                         Image("ResetZoom")
-                            .foregroundColor(.accentColor)
+                            .foregroundColor(viewModel.isMainWindow ? .accentColor : .secondary)
                     }
                     .buttonStyle(.plain)
                     .help("Reset Split Zoom")
