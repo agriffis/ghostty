@@ -1,0 +1,9 @@
+using Gtk 4.0;
+using Adw 1;
+
+template $GhostttySurfaceScrolledWindow: Adw.Bin {
+  Gtk.ScrolledWindow scrolled_window {
+    hscrollbar-policy: always;
+    vscrollbar-policy: always;
+  }
+}

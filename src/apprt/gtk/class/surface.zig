@@ -40,12 +40,16 @@ pub const Surface = extern struct {
     const Self = @This();
     parent_instance: Parent,
     pub const Parent = adw.Bin;
+    pub const Implements = [_]type{gtk.Scrollable};
     pub const getGObjectType = gobject.ext.defineClass(Self, .{
         .name = "GhosttySurface",
         .instanceInit = &init,
         .classInit = &Class.init,
         .parent_class = &Class.parent,
         .private = .{ .Type = Private, .offset = &Private.offset },
+        .implements = &.{
+            gobject.ext.implement(gtk.Scrollable, .{}),
+        },
     });
 
     /// A SplitTree implementation that stores surfaces.
@@ -301,6 +305,62 @@ pub const Surface = extern struct {
                 },
             );
         };
+
+        pub const hadjustment = struct {
+            pub const name = "hadjustment";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?*gtk.Adjustment,
+                .{
+                    .accessor = .{
+                        .getter = getHAdjustmentValue,
+                        .setter = setHAdjustmentValue,
+                    },
+                },
+            );
+        };
+
+        pub const vadjustment = struct {
+            pub const name = "vadjustment";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                ?*gtk.Adjustment,
+                .{
+                    .accessor = .{
+                        .getter = getVAdjustmentValue,
+                        .setter = setVAdjustmentValue,
+                    },
+                },
+            );
+        };
+
+        pub const @"hscroll-policy" = struct {
+            pub const name = "hscroll-policy";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                gtk.ScrollablePolicy,
+                .{
+                    .default = .natural,
+                    .accessor = C.privateShallowFieldAccessor("hscroll_policy"),
+                },
+            );
+        };
+
+        pub const @"vscroll-policy" = struct {
+            pub const name = "vscroll-policy";
+            const impl = gobject.ext.defineProperty(
+                name,
+                Self,
+                gtk.ScrollablePolicy,
+                .{
+                    .default = .natural,
+                    .accessor = C.privateShallowFieldAccessor("vscroll_policy"),
+                },
+            );
+        };
     };
 
     pub const signals = struct {
@@ -548,6 +608,12 @@ pub const Surface = extern struct {
 
         action_group: ?*gio.SimpleActionGroup = null,
 
+        // Gtk.Scrollable interface adjustments
+        hadj: ?*gtk.Adjustment = null,
+        vadj: ?*gtk.Adjustment = null,
+        hscroll_policy: gtk.ScrollablePolicy = .natural,
+        vscroll_policy: gtk.ScrollablePolicy = .natural,
+
         // Template binds
         child_exited_overlay: *ChildExited,
         context_menu: *gtk.PopoverMenu,
@@ -712,6 +778,23 @@ pub const Surface = extern struct {
     pub fn showOnScreenKeyboard(self: *Self, event: ?*gdk.Event) bool {
         const priv = self.private();
         return priv.im_context.as(gtk.IMContext).activateOsk(event) != 0;
+    }
+
+    /// Set the scrollbar state for this surface. This will setup the
+    /// properties for our Gtk.Scrollable interface properly.
+    pub fn setScrollbar(self: *Self, scrollbar: terminal.Scrollbar) void {
+        // Update existing adjustment in-place. If we don't have an
+        // adjustment then we do nothing because we're not part of a
+        // scrolled window.
+        const vadj = self.getVAdjustment() orelse return;
+        vadj.configure(
+            @floatFromInt(scrollbar.offset), // value: current scroll position
+            0, // lower: minimum value
+            @floatFromInt(scrollbar.total), // upper: maximum value (total scrollable area)
+            1, // step_increment: amount to scroll on arrow click
+            @floatFromInt(scrollbar.len), // page_increment: amount to scroll on page up/down
+            @floatFromInt(scrollbar.len), // page_size: size of visible area
+        );
     }
 
     /// Set the current progress report state.
@@ -1583,6 +1666,16 @@ pub const Surface = extern struct {
             priv.config = null;
         }
 
+        if (priv.hadj) |v| {
+            v.as(gobject.Object).unref();
+            priv.hadj = null;
+        }
+
+        if (priv.vadj) |v| {
+            v.as(gobject.Object).unref();
+            priv.vadj = null;
+        }
+
         if (priv.progress_bar_timer) |timer| {
             if (glib.Source.remove(timer) == 0) {
                 log.warn("unable to remove progress bar timer", .{});
@@ -2058,6 +2151,53 @@ pub const Surface = extern struct {
             media_stream.setVolume(volume);
             media_stream.play();
         }
+    }
+
+    //---------------------------------------------------------------
+    // Gtk.Scrollable interface implementation
+
+    pub fn getHAdjustment(self: *Self) ?*gtk.Adjustment {
+        return self.private().hadj;
+    }
+
+    pub fn setHAdjustment(self: *Self, adj: ?*gtk.Adjustment) void {
+        const priv = self.private();
+        if (priv.hadj) |old| old.as(gobject.Object).unref();
+        priv.hadj = if (adj) |a| blk: {
+            _ = a.as(gobject.Object).ref();
+            break :blk a;
+        } else null;
+        self.as(gobject.Object).notifyByPspec(properties.hadjustment.impl.param_spec);
+    }
+
+    fn getHAdjustmentValue(self: *Self, value: *gobject.Value) void {
+        gobject.ext.Value.set(value, self.getHAdjustment());
+    }
+
+    fn setHAdjustmentValue(self: *Self, value: *const gobject.Value) void {
+        self.setHAdjustment(gobject.ext.Value.get(value, ?*gtk.Adjustment));
+    }
+
+    pub fn getVAdjustment(self: *Self) ?*gtk.Adjustment {
+        return self.private().vadj;
+    }
+
+    pub fn setVAdjustment(self: *Self, adj: ?*gtk.Adjustment) void {
+        const priv = self.private();
+        if (priv.vadj) |old| old.as(gobject.Object).unref();
+        priv.vadj = if (adj) |a| blk: {
+            _ = a.as(gobject.Object).ref();
+            break :blk a;
+        } else null;
+        self.as(gobject.Object).notifyByPspec(properties.vadjustment.impl.param_spec);
+    }
+
+    fn getVAdjustmentValue(self: *Self, value: *gobject.Value) void {
+        gobject.ext.Value.set(value, self.getVAdjustment());
+    }
+
+    fn setVAdjustmentValue(self: *Self, value: *const gobject.Value) void {
+        self.setVAdjustment(gobject.ext.Value.get(value, ?*gtk.Adjustment));
     }
 
     //---------------------------------------------------------------
@@ -3034,6 +3174,12 @@ pub const Surface = extern struct {
                 properties.@"title-override".impl,
                 properties.zoom.impl,
                 properties.@"is-split".impl,
+
+                // For Gtk.Scrollable
+                properties.hadjustment.impl,
+                properties.vadjustment.impl,
+                properties.@"hscroll-policy".impl,
+                properties.@"vscroll-policy".impl,
             });
 
             // Signals
