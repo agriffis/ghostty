@@ -611,6 +611,7 @@ pub const Surface = extern struct {
         // Gtk.Scrollable interface adjustments
         hadj: ?*gtk.Adjustment = null,
         vadj: ?*gtk.Adjustment = null,
+        vadj_handler: c_ulong = 0,
         hscroll_policy: gtk.ScrollablePolicy = .natural,
         vscroll_policy: gtk.ScrollablePolicy = .natural,
 
@@ -787,13 +788,26 @@ pub const Surface = extern struct {
         // adjustment then we do nothing because we're not part of a
         // scrolled window.
         const vadj = self.getVAdjustment() orelse return;
+
+        // Check if values match existing adjustment and skip update if so
+        const value: f64 = @floatFromInt(scrollbar.offset);
+        const upper: f64 = @floatFromInt(scrollbar.total);
+        const page_size: f64 = @floatFromInt(scrollbar.len);
+
+        if (std.math.approxEqAbs(f64, vadj.getValue(), value, 0.001) and
+            std.math.approxEqAbs(f64, vadj.getUpper(), upper, 0.001) and
+            std.math.approxEqAbs(f64, vadj.getPageSize(), page_size, 0.001))
+        {
+            return;
+        }
+
         vadj.configure(
-            @floatFromInt(scrollbar.offset), // value: current scroll position
+            value, // value: current scroll position
             0, // lower: minimum value
-            @floatFromInt(scrollbar.total), // upper: maximum value (total scrollable area)
+            upper, // upper: maximum value (total scrollable area)
             1, // step_increment: amount to scroll on arrow click
-            @floatFromInt(scrollbar.len), // page_increment: amount to scroll on page up/down
-            @floatFromInt(scrollbar.len), // page_size: size of visible area
+            page_size, // page_increment: amount to scroll on page up/down
+            page_size, // page_size: size of visible area
         );
     }
 
@@ -2184,11 +2198,32 @@ pub const Surface = extern struct {
 
     pub fn setVAdjustment(self: *Self, adj: ?*gtk.Adjustment) void {
         const priv = self.private();
+
+        // Disconnect old signal handler if present
+        if (priv.vadj_handler != 0) {
+            if (priv.vadj) |old_adj| {
+                gobject.signalHandlerDisconnect(old_adj.as(gobject.Object), priv.vadj_handler);
+            }
+            priv.vadj_handler = 0;
+        }
+
         if (priv.vadj) |old| old.as(gobject.Object).unref();
         priv.vadj = if (adj) |a| blk: {
             _ = a.as(gobject.Object).ref();
             break :blk a;
         } else null;
+
+        // Connect to value-changed signal on new adjustment
+        if (priv.vadj) |new_adj| {
+            priv.vadj_handler = gtk.Adjustment.signals.value_changed.connect(
+                new_adj,
+                *Self,
+                vadjValueChanged,
+                self,
+                .{},
+            );
+        }
+
         self.as(gobject.Object).notifyByPspec(properties.vadjustment.impl.param_spec);
     }
 
@@ -2202,6 +2237,15 @@ pub const Surface = extern struct {
 
     //---------------------------------------------------------------
     // Signal Handlers
+
+    fn vadjValueChanged(adj: *gtk.Adjustment, self: *Self) callconv(.c) void {
+        const value = adj.getValue();
+        const core_surface = self.core() orelse return;
+        const row: usize = @intFromFloat(value);
+        _ = core_surface.performBindingAction(.{ .scroll_to_row = row }) catch |err| {
+            log.err("error performing scroll_to_row action err={}", .{err});
+        };
+    }
 
     pub fn actionPromptTitle(
         _: *gio.SimpleAction,
