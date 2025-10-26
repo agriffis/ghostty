@@ -1765,7 +1765,7 @@ keybind: Keybinds = .{},
 ///   * `ghostty` - Use the background and foreground colors specified in the
 ///     Ghostty configuration. This is only supported on Linux builds.
 ///
-/// On macOS, if `macos-titlebar-style` is "tabs", the window theme will be
+/// On macOS, if `macos-titlebar-style` is `tabs` or `transparent`, the window theme will be
 /// automatically set based on the luminosity of the terminal background color.
 /// This only applies to terminal windows. This setting will still apply to
 /// non-terminal windows within Ghostty.
@@ -2646,7 +2646,9 @@ keybind: Keybinds = .{},
 ///    This could result in an audiovisual effect, a notification, or something
 ///    else entirely. Changing these effects require altering system settings:
 ///    for instance under the "Sound > Alert Sound" setting in GNOME,
-///    or the "Accessibility > System Bell" settings in KDE Plasma. (GTK only)
+///    or the "Accessibility > System Bell" settings in KDE Plasma.
+///
+///    On macOS, this plays the system alert sound.
 ///
 ///  * `audio`
 ///
