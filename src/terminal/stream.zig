@@ -1992,8 +1992,6 @@ pub fn Stream(comptime Handler: type) type {
                     log.warn("invalid OSC, should never happen", .{});
                 },
             }
-
-            log.warn("unimplemented OSC command: {s}", .{@tagName(cmd)});
         }
 
         inline fn configureCharset(
