@@ -31,11 +31,12 @@ pub fn main() !void {
     // Use TerminalFormatter to emit HTML
     const formatter: ghostty_vt.formatter.TerminalFormatter = .init(&t, .{
         .emit = .html,
-        .palette = &t.color_palette.colors,
+        .palette = &t.colors.palette.current,
     });
 
     // Write to stdout
     var stdout_writer = std.fs.File.stdout().writer(&buf);
     const stdout = &stdout_writer.interface;
     try stdout.print("{f}", .{formatter});
+    try stdout.flush();
 }
