@@ -16,8 +16,10 @@ const Mutex = std.Thread.Mutex;
 const xev = @import("../../global.zig").xev;
 const internal_os = @import("../../os/main.zig");
 const BlockingQueue = @import("../../datastruct/main.zig").BlockingQueue;
+const PageList = @import("../PageList.zig");
 const Screen = @import("../Screen.zig");
 const ScreenSet = @import("../ScreenSet.zig");
+const Selection = @import("../Selection.zig");
 const Terminal = @import("../Terminal.zig");
 
 const ScreenSearch = @import("screen.zig").ScreenSearch;
@@ -89,7 +91,7 @@ pub fn deinit(self: *Thread) void {
     // Nothing can possibly access the mailbox anymore, destroy it.
     self.mailbox.destroy(self.alloc);
 
-    if (self.search) |*s| s.deinit();
+    if (self.search) |*s| s.deinit(self.alloc);
 }
 
 /// The main entrypoint for the thread.
@@ -215,7 +217,7 @@ fn changeNeedle(self: *Thread, needle: []const u8) !void {
 
     // Stop the previous search
     if (self.search) |*s| {
-        s.deinit();
+        s.deinit(self.alloc);
         self.search = null;
     }
 
@@ -310,6 +312,11 @@ const Search = struct {
     /// The last total matches reported.
     last_total: ?usize,
 
+    /// The last viewport we observed, so we can detect changes and
+    /// send new results.
+    last_viewport: ?Viewport,
+    last_viewport_matches: std.ArrayList(Selection),
+
     pub fn init(
         alloc: Allocator,
         needle: []const u8,
@@ -329,12 +336,16 @@ const Search = struct {
             .screens = .init(.{ .primary = screen_search }),
             .last_active_screen = .primary,
             .last_total = null,
+            .last_viewport = null,
+            .last_viewport_matches = .empty,
         };
     }
 
-    pub fn deinit(self: *Search) void {
+    pub fn deinit(self: *Search, alloc: Allocator) void {
         var it = self.screens.iterator();
         while (it.next()) |entry| entry.value.deinit();
+        if (self.last_viewport) |*vp| vp.deinit(alloc);
+        self.last_viewport_matches.deinit(alloc);
     }
 
     /// Returns true if all searches on all screens are complete.
@@ -455,6 +466,22 @@ const Search = struct {
             }
         }
 
+        // Check our viewport for changes.
+        var actual_vp: Viewport = try .init(alloc, t.screens.active);
+        if (self.last_viewport) |*last_vp| {
+            if (!last_vp.eql(actual_vp)) {
+                last_vp.deinit(alloc);
+                self.last_viewport = null;
+            }
+        }
+        if (self.last_viewport == null) {
+            self.last_viewport = actual_vp;
+            self.last_viewport_matches.clearRetainingCapacity(); // force notification
+        } else {
+            // Last viewport matches actual, free actual since we don't need it.
+            actual_vp.deinit(alloc);
+        }
+
         // Feed data
         var it = self.screens.iterator();
         while (it.next()) |entry| {
@@ -473,11 +500,47 @@ const Search = struct {
         ud: ?*anyopaque,
     ) void {
         const screen_search = self.screens.get(self.last_active_screen) orelse return;
+
+        // Check our total match data
         const total = screen_search.matchesLen();
         if (total != self.last_total) {
             self.last_total = total;
             cb(.{ .total_matches = total }, ud);
         }
+
+        // Check our viewport matches
+        // TODO
+    }
+};
+
+/// Viewport state so we can detect when the viewport moves.
+const Viewport = struct {
+    /// The chunks that make up the viewport. We need to flatten this
+    /// to a single list because we can't safely traverse the cached values
+    /// because the page nodes may be invalid. All that is safe is comparing
+    /// the actual pointer values.
+    chunks: []const PageList.PageIterator.Chunk,
+
+    pub fn init(alloc: Allocator, screen: *Screen) Allocator.Error!Viewport {
+        var list: std.ArrayList(PageList.PageIterator.Chunk) = .empty;
+        defer list.deinit(alloc);
+        var it = screen.pages.pageIterator(.right_down, .{ .active = .{} }, null);
+        while (it.next()) |chunk| try list.append(alloc, chunk);
+        return .{ .chunks = try list.toOwnedSlice(alloc) };
+    }
+
+    pub fn deinit(self: *Viewport, alloc: Allocator) void {
+        alloc.free(self.chunks);
+    }
+
+    pub fn eql(self: Viewport, other: Viewport) bool {
+        if (self.chunks.len != other.chunks.len) return false;
+        for (self.chunks, other.chunks) |a, b| {
+            if (a.node != b.node or
+                a.start != b.start or
+                a.end != b.end) return false;
+        }
+        return true;
     }
 };
 
