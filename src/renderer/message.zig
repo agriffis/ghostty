@@ -10,7 +10,7 @@ const terminal = @import("../terminal/main.zig");
 pub const Message = union(enum) {
     /// Purposely crash the renderer. This is used for testing and debugging.
     /// See the "crash" binding action.
-    crash: void,
+    crash,
 
     /// A change in state in the window focus that this renderer is
     /// rendering within. This is only sent when a change is detected so
@@ -24,7 +24,7 @@ pub const Message = union(enum) {
 
     /// Reset the cursor blink by immediately showing the cursor then
     /// restarting the timer.
-    reset_cursor_blink: void,
+    reset_cursor_blink,
 
     /// Change the font grid. This can happen for any number of reasons
     /// including a font size change, family change, etc.
@@ -50,6 +50,14 @@ pub const Message = union(enum) {
         alloc: Allocator,
         thread: *renderer.Thread.DerivedConfig,
         impl: *renderer.Renderer.DerivedConfig,
+    },
+
+    /// Matches for the current viewport from the search thread. These happen
+    /// async so they may be off for a frame or two from the actually rendered
+    /// viewport. The renderer must handle this gracefully.
+    search_viewport_matches: struct {
+        alloc: Allocator,
+        matches: []const terminal.Selection,
     },
 
     /// Activate or deactivate the inspector.

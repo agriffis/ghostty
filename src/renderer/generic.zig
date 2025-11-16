@@ -120,6 +120,16 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         scrollbar: terminal.Scrollbar,
         scrollbar_dirty: bool,
 
+        /// The most recent viewport matches so that we can render search
+        /// matches in the visible frame. This is provided asynchronously
+        /// from the search thread so we have the dirty flag to also note
+        /// if we need to rebuild our cells to include search highlights.
+        ///
+        /// Note that the selections MAY BE INVALID (point to PageList nodes
+        /// that do not exist anymore). These must be validated prior to use.
+        search_matches: []const terminal.Selection,
+        search_matches_dirty: bool,
+
         /// The current set of cells to render. This is rebuilt on every frame
         /// but we keep this around so that we don't reallocate. Each set of
         /// cells goes into a separate shader.
@@ -667,6 +677,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
                 .focused = true,
                 .scrollbar = .zero,
                 .scrollbar_dirty = false,
+                .search_matches = &.{},
+                .search_matches_dirty = false,
 
                 // Render state
                 .cells = .{},
@@ -738,6 +750,8 @@ pub fn Renderer(comptime GraphicsAPI: type) type {
         }
 
         pub fn deinit(self: *Self) void {
+            self.alloc.free(self.search_matches);
+
             self.swap_chain.deinit();
 
             if (DisplayLink != void) {
