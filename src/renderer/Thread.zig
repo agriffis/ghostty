@@ -451,6 +451,14 @@ fn drainMailbox(self: *Thread) !void {
                 self.startDrawTimer();
             },
 
+            .search_viewport_matches => |v| {
+                // Note we don't free the new value because we expect our
+                // allocators to match.
+                v.alloc.free(self.renderer.search_matches);
+                self.renderer.search_matches = v.matches;
+                self.renderer.search_matches_dirty = true;
+            },
+
             .inspector => |v| self.flags.has_inspector = v,
 
             .macos_display_id => |v| {
