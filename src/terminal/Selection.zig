@@ -387,6 +387,91 @@ pub fn containedRowCached(
     );
 }
 
+/// Clamp the selection into the given nodes so that the top-left
+/// and bottom-right do not exceed the given nodes.
+///
+/// Assumes an ordered selection for performance.
+pub fn clamp(
+    self: *const Selection,
+    chunks: []const *PageList.PageIterator.Chunk,
+) ?Selection {
+    // Assumes ordered!
+    const tl = self.start();
+    const br = self.end();
+
+    // Find our start by going right down first.
+    const clamped_tl: Pin = tl: {
+        var it = tl.pageIterator(.right_down, br);
+        while (it.next()) |sel_chunk| {
+            for (chunks) |chunk| {
+                if (chunk.node != sel_chunk.node) continue;
+
+                // If our clamped chunk starts below the selection chunk within
+                // the matching page, then we are starting at the chunk at x=0
+                // because we're in the selection.
+                if (chunk.start > sel_chunk.start) break :tl .{
+                    .node = chunk.node,
+                    .x = 0,
+                    .y = chunk.start,
+                };
+
+                // If our clamped chunk ends before the selection chunk, then
+                // our top-left is not in the selection.
+                if (chunk.end < sel_chunk.end) return null;
+
+                // Our selection starts somewhere within our chunk.
+                break :tl .{
+                    .node = chunk.node,
+                    .y = sel_chunk.start,
+                    .x = if (chunk.node == tl.node) tl.x else 0,
+                };
+            }
+        }
+
+        // No matching chunk
+        return null;
+    };
+
+    // Find our end by iterating forward from the tl.
+    const clamped_br: Pin = br: {
+        var it = br.pageIterator(
+            .left_up,
+            clamped_tl,
+        );
+        while (it.next()) |sel_chunk| {
+            for (chunks) |chunk| {
+                if (chunk.node != sel_chunk.node) continue;
+
+                // If our clamped chunk ends above the selection chunk within
+                // the matching page, then we are ending at the chunk at the
+                // end of the line because we're in the selection.
+                if (chunk.end < sel_chunk.end) break :br .{
+                    .node = chunk.node,
+                    .x = chunk.node.data.size.cols - 1,
+                    .y = chunk.end - 1,
+                };
+
+                // Our selection ends somewhere within our chunk.
+                break :br .{
+                    .node = chunk.node,
+                    .y = sel_chunk.end - 1,
+                    .x = if (chunk.node == br.node) br.x else chunk.node.data.size.cols - 1,
+                };
+            }
+        }
+
+        // No matching chunk. This can't possibly happen because we found
+        // the top left.
+        unreachable;
+    };
+
+    return .init(
+        clamped_tl,
+        clamped_br,
+        self.rectangle,
+    );
+}
+
 /// Possible adjustments to the selection.
 pub const Adjustment = enum {
     left,
