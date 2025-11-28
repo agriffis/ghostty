@@ -1301,6 +1301,60 @@ pub fn SplitTree(comptime V: type) type {
 
             .none => void,
         };
+
+        /// A C-compatible API for using a split tree. The caller has to
+        /// manually `@export` these symbols if they need them.
+        ///
+        /// This is currently read-only since modification APIs aren't
+        /// presently necessary from C. This will likely change in the future.
+        pub const CApi = struct {
+            pub const NodeTag = enum(c_int) {
+                leaf,
+                split,
+            };
+
+            pub const Split = extern struct {
+                horizontal: bool,
+                ratio: f32,
+                left: Node.Handle,
+                right: Node.Handle,
+            };
+
+            pub fn is_empty(self: *const Self) callconv(.c) bool {
+                return self.isEmpty();
+            }
+
+            pub fn len(self: *const Self) callconv(.c) usize {
+                return self.nodes.len;
+            }
+
+            pub fn is_split(self: *const Self, handle: Node.Handle) callconv(.c) bool {
+                return switch (self.nodes[handle.idx()]) {
+                    .leaf => false,
+                    .split => true,
+                };
+            }
+
+            pub fn get_split(
+                self: *const Self,
+                handle: Node.Handle,
+            ) callconv(.c) CApi.Split {
+                const s = self.nodes[handle.idx()].split;
+                return .{
+                    .horizontal = switch (s.layout) {
+                        .horizontal => true,
+                        .vertical => false,
+                    },
+                    .ratio = @floatCast(s.ratio),
+                    .left = s.left,
+                    .right = s.right,
+                };
+            }
+
+            pub fn get_leaf(self: *const Self, handle: Node.Handle) *View {
+                return self.nodes[handle.idx()].leaf;
+            }
+        };
     };
 }
 
@@ -2201,4 +2255,146 @@ test "SplitTree: remove and zoom" {
             \\
         );
     }
+}
+
+test "SplitTree: CApi is_empty" {
+    const testing = std.testing;
+
+    var empty: TestTree = .empty;
+    defer empty.deinit();
+    try testing.expect(TestTree.CApi.is_empty(&empty));
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(testing.allocator, &v1);
+    defer t1.deinit();
+    try testing.expect(!TestTree.CApi.is_empty(&t1));
+}
+
+test "SplitTree: CApi len" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var empty: TestTree = .empty;
+    defer empty.deinit();
+    try testing.expectEqual(@as(usize, 0), TestTree.CApi.len(&empty));
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    try testing.expectEqual(@as(usize, 1), TestTree.CApi.len(&t1));
+
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+
+    var split = try t1.split(
+        alloc,
+        .root,
+        .right,
+        0.5,
+        &t2,
+    );
+    defer split.deinit();
+    try testing.expectEqual(@as(usize, 3), TestTree.CApi.len(&split));
+}
+
+test "SplitTree: CApi is_split" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    try testing.expect(!TestTree.CApi.is_split(&t1, .root));
+
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+
+    var split = try t1.split(
+        alloc,
+        .root,
+        .right,
+        0.5,
+        &t2,
+    );
+    defer split.deinit();
+    try testing.expect(TestTree.CApi.is_split(&split, .root));
+    try testing.expect(!TestTree.CApi.is_split(&split, @enumFromInt(1)));
+    try testing.expect(!TestTree.CApi.is_split(&split, @enumFromInt(2)));
+}
+
+test "SplitTree: CApi get_split" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+
+    var split_h = try t1.split(
+        alloc,
+        .root,
+        .right,
+        0.5,
+        &t2,
+    );
+    defer split_h.deinit();
+
+    const s_h = TestTree.CApi.get_split(&split_h, .root);
+    try testing.expect(s_h.horizontal);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), s_h.ratio, 0.01);
+    try testing.expectEqual(@as(TestTree.Node.Handle, @enumFromInt(2)), s_h.left);
+    try testing.expectEqual(@as(TestTree.Node.Handle, @enumFromInt(1)), s_h.right);
+
+    var v3: TestTree.View = .{ .label = "C" };
+    var t3: TestTree = try .init(alloc, &v3);
+    defer t3.deinit();
+
+    var split_v = try t1.split(
+        alloc,
+        .root,
+        .down,
+        0.7,
+        &t3,
+    );
+    defer split_v.deinit();
+
+    const s_v = TestTree.CApi.get_split(&split_v, .root);
+    try testing.expect(!s_v.horizontal);
+    try testing.expectApproxEqAbs(@as(f32, 0.7), s_v.ratio, 0.01);
+}
+
+test "SplitTree: CApi get_leaf" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var v1: TestTree.View = .{ .label = "A" };
+    var t1: TestTree = try .init(alloc, &v1);
+    defer t1.deinit();
+
+    const leaf = TestTree.CApi.get_leaf(&t1, .root);
+    try testing.expectEqualStrings("A", leaf.label);
+
+    var v2: TestTree.View = .{ .label = "B" };
+    var t2: TestTree = try .init(alloc, &v2);
+    defer t2.deinit();
+
+    var split = try t1.split(
+        alloc,
+        .root,
+        .right,
+        0.5,
+        &t2,
+    );
+    defer split.deinit();
+
+    const leaf_a = TestTree.CApi.get_leaf(&split, @enumFromInt(2));
+    try testing.expectEqualStrings("A", leaf_a.label);
+
+    const leaf_b = TestTree.CApi.get_leaf(&split, @enumFromInt(1));
+    try testing.expectEqualStrings("B", leaf_b.label);
 }
