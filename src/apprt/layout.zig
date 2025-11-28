@@ -3,6 +3,25 @@ const Allocator = std.mem.Allocator;
 const configpkg = @import("../config.zig");
 const datastruct = @import("../datastruct/main.zig");
 
+/// Window represents a desired predefined layout for a window hierarchy:
+/// a set of tabs, each with their own split tree.
+pub const Window = struct {
+    /// NOTE: For now, we guarantee tabs.len == 1. This is to simplify
+    /// the initial implementation. In the future we will support layouts
+    /// for multiple tabs.
+    tabs: []const SplitTree,
+
+    pub const CApi = struct {
+        pub fn get_tabs_len(self: *const Window) callconv(.c) usize {
+            return self.tabs.len;
+        }
+
+        pub fn get_tabs(self: *const Window) callconv(.c) [*]const SplitTree {
+            return &self.tabs;
+        }
+    };
+};
+
 /// SplitTree represents a desired layout of splits and their associated
 /// surface configurations. This is used by apprts to launch and modify
 /// predefined terminal layouts.

@@ -91,6 +91,9 @@ pub const Action = union(Key) {
     /// relative to the target.
     new_split: SplitDirection,
 
+    /// Create a new window, tab, etc. as necessary to apply the given layout.
+    new_window_layout: Layout,
+
     /// Close all open windows.
     close_all_windows,
 
@@ -320,6 +323,7 @@ pub const Action = union(Key) {
         new_tab,
         close_tab,
         new_split,
+        new_window_layout,
         close_all_windows,
         toggle_maximize,
         toggle_fullscreen,
@@ -445,6 +449,17 @@ pub const Action = union(Key) {
             .key = @as(Key, self),
             .value = value,
         };
+    }
+};
+
+// See apprt.layout
+pub const Layout = struct {
+    window: apprt.layout.Window,
+
+    pub const C = *const apprt.layout.Window;
+
+    pub fn cval(self: *const Layout) C {
+        return &self.window;
     }
 };
 

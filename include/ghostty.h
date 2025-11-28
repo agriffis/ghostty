@@ -30,6 +30,8 @@ typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
+typedef void* ghostty_layout_window_t;
+typedef void* ghostty_layout_tab_t;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -776,6 +778,7 @@ typedef enum {
   GHOSTTY_ACTION_NEW_TAB,
   GHOSTTY_ACTION_CLOSE_TAB,
   GHOSTTY_ACTION_NEW_SPLIT,
+  GHOSTTY_ACTION_NEW_WINDOW_LAYOUT,
   GHOSTTY_ACTION_CLOSE_ALL_WINDOWS,
   GHOSTTY_ACTION_TOGGLE_MAXIMIZE,
   GHOSTTY_ACTION_TOGGLE_FULLSCREEN,
@@ -834,6 +837,7 @@ typedef enum {
 
 typedef union {
   ghostty_action_split_direction_e new_split;
+  ghostty_layout_window_t new_window_layout;
   ghostty_action_fullscreen_e toggle_fullscreen;
   ghostty_action_move_tab_s move_tab;
   ghostty_action_goto_tab_e goto_tab;
