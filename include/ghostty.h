@@ -30,8 +30,19 @@ typedef void* ghostty_app_t;
 typedef void* ghostty_config_t;
 typedef void* ghostty_surface_t;
 typedef void* ghostty_inspector_t;
-typedef void* ghostty_layout_window_t;
-typedef void* ghostty_layout_tab_t;
+
+// Layout API
+typedef void* ghostty_window_layout_t;
+typedef void* ghostty_tab_layout_t;
+typedef void* ghostty_tab_layout_leaf_t;
+typedef uint16_t ghostty_tab_layout_node_t;
+
+typedef struct {
+  bool horizontal;
+  float ratio;
+  ghostty_tab_layout_node_t left;
+  ghostty_tab_layout_node_t right;
+} ghostty_tab_layout_split_s;
 
 // All the types below are fully defined and must be kept in sync with
 // their Zig counterparts. Any changes to these types MUST have an associated
@@ -837,7 +848,7 @@ typedef enum {
 
 typedef union {
   ghostty_action_split_direction_e new_split;
-  ghostty_layout_window_t new_window_layout;
+  ghostty_window_layout_t new_window_layout;
   ghostty_action_fullscreen_e toggle_fullscreen;
   ghostty_action_move_tab_s move_tab;
   ghostty_action_goto_tab_e goto_tab;
@@ -1069,6 +1080,19 @@ bool ghostty_inspector_metal_init(ghostty_inspector_t, void*);
 void ghostty_inspector_metal_render(ghostty_inspector_t, void*, void*);
 bool ghostty_inspector_metal_shutdown(ghostty_inspector_t);
 #endif
+
+// Layout API
+size_t ghostty_window_layout_get_tabs_len(ghostty_window_layout_t);
+const ghostty_tab_layout_t* ghostty_window_layout_get_tabs(ghostty_window_layout_t);
+bool ghostty_tab_layout_is_empty(ghostty_tab_layout_t);
+size_t ghostty_tab_layout_get_nodes_len(ghostty_tab_layout_t);
+bool ghostty_tab_layout_is_split_node(ghostty_tab_layout_t, ghostty_tab_layout_node_t);
+ghostty_tab_layout_split_s ghostty_tab_layout_get_split_node(ghostty_tab_layout_t,
+                                                              ghostty_tab_layout_node_t);
+ghostty_tab_layout_leaf_t ghostty_tab_layout_get_leaf_node(ghostty_tab_layout_t,
+                                                            ghostty_tab_layout_node_t);
+uint64_t ghostty_tab_layout_leaf_get_id(ghostty_tab_layout_leaf_t);
+ghostty_config_t ghostty_tab_layout_leaf_get_config(ghostty_tab_layout_leaf_t);
 
 // APIs I'd like to get rid of eventually but are still needed for now.
 // Don't use these unless you know what you're doing.

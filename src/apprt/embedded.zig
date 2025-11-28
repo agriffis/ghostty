@@ -20,6 +20,7 @@ const CoreInspector = @import("../inspector/main.zig").Inspector;
 const CoreSurface = @import("../Surface.zig");
 const configpkg = @import("../config.zig");
 const Config = configpkg.Config;
+const layout = @import("layout.zig");
 
 const log = std.log.scoped(.embedded_window);
 
@@ -1338,6 +1339,19 @@ pub const CAPI = struct {
         if (builtin.target.os.tag.isDarwin()) {
             _ = Darwin;
         }
+    }
+
+    // Layout C API exports
+    comptime {
+        @export(&layout.Window.CApi.get_tabs_len, .{ .name = "ghostty_window_layout_get_tabs_len" });
+        @export(&layout.Window.CApi.get_tabs, .{ .name = "ghostty_window_layout_get_tabs" });
+        @export(&layout.SplitTree.CApi.is_empty, .{ .name = "ghostty_tab_layout_is_empty" });
+        @export(&layout.SplitTree.CApi.len, .{ .name = "ghostty_tab_layout_get_nodes_len" });
+        @export(&layout.SplitTree.CApi.is_split, .{ .name = "ghostty_tab_layout_is_split_node" });
+        @export(&layout.SplitTree.CApi.get_split, .{ .name = "ghostty_tab_layout_get_split_node" });
+        @export(&layout.SplitTree.CApi.get_leaf, .{ .name = "ghostty_tab_layout_get_leaf_node" });
+        @export(&layout.SplitTree.View.CApi.get_id, .{ .name = "ghostty_tab_layout_leaf_get_id" });
+        @export(&layout.SplitTree.View.CApi.get_config, .{ .name = "ghostty_tab_layout_leaf_get_config" });
     }
 
     /// Create a new app.

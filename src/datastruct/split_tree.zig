@@ -1351,7 +1351,7 @@ pub fn SplitTree(comptime V: type) type {
                 };
             }
 
-            pub fn get_leaf(self: *const Self, handle: Node.Handle) *View {
+            pub fn get_leaf(self: *const Self, handle: Node.Handle) callconv(.c) *View {
                 return self.nodes[handle.idx()].leaf;
             }
         };

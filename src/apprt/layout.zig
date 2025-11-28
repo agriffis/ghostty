@@ -17,7 +17,7 @@ pub const Window = struct {
         }
 
         pub fn get_tabs(self: *const Window) callconv(.c) [*]const SplitTree {
-            return &self.tabs;
+            return self.tabs.ptr;
         }
     };
 };
