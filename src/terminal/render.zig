@@ -5,6 +5,7 @@ const ArenaAllocator = std.heap.ArenaAllocator;
 const fastmem = @import("../fastmem.zig");
 const color = @import("color.zig");
 const cursor = @import("cursor.zig");
+const highlight = @import("highlight.zig");
 const point = @import("point.zig");
 const size = @import("size.zig");
 const page = @import("page.zig");
@@ -191,6 +192,18 @@ pub const RenderState = struct {
 
         /// The x range of the selection within this row.
         selection: ?[2]size.CellCountInt,
+
+        /// The highlights within this row.
+        highlights: std.ArrayList(Highlight),
+    };
+
+    pub const Highlight = struct {
+        /// A special tag that can be used by the caller to differentiate
+        /// different highlight types. The value is opaque to the RenderState.
+        tag: u8,
+
+        /// The x ranges of highlights within this row.
+        range: [2]size.CellCountInt,
     };
 
     pub const Cell = struct {
@@ -348,6 +361,7 @@ pub const RenderState = struct {
                         .cells = .empty,
                         .dirty = true,
                         .selection = null,
+                        .highlights = .empty,
                     });
                 }
             } else {
@@ -371,6 +385,7 @@ pub const RenderState = struct {
         const row_rows = row_data.items(.raw);
         const row_cells = row_data.items(.cells);
         const row_sels = row_data.items(.selection);
+        const row_highlights = row_data.items(.highlights);
         const row_dirties = row_data.items(.dirty);
 
         // Track the last page that we know was dirty. This lets us
@@ -427,6 +442,7 @@ pub const RenderState = struct {
                     // faster than iterating pages again later.
                     if (last_dirty_page) |last_p| last_p.dirty = false;
                     last_dirty_page = p;
+                    break :dirty;
                 }
 
                 // If our row is dirty then we're dirty.
@@ -453,6 +469,7 @@ pub const RenderState = struct {
                 _ = arena.reset(.retain_capacity);
                 row_cells[y].clearRetainingCapacity();
                 row_sels[y] = null;
+                row_highlights[y] = .empty;
             }
             row_dirties[y] = true;
 
@@ -628,6 +645,88 @@ pub const RenderState = struct {
         // Clear our dirty flags
         t.flags.dirty = .{};
         s.dirty = .{};
+    }
+
+    /// Update the highlights in the render state from the given flattened
+    /// highlights. Because this uses flattened highlights, it does not require
+    /// reading from the terminal state so it should be done outside of
+    /// any critical sections.
+    ///
+    /// This will not clear any previous highlights, so the caller must
+    /// manually clear them if desired.
+    pub fn updateHighlightsFlattened(
+        self: *RenderState,
+        alloc: Allocator,
+        tag: u8,
+        hls: []const highlight.Flattened,
+    ) Allocator.Error!void {
+        // Fast path, we have no highlights!
+        if (hls.len == 0) return;
+
+        // This is, admittedly, horrendous. This is some low hanging fruit
+        // to optimize. In my defense, screens are usually small, the number
+        // of highlights is usually small, and this only happens on the
+        // viewport outside of a locked area. Still, I'd love to see this
+        // improved someday.
+
+        // We need to track whether any row had a match so we can mark
+        // the dirty state.
+        var any_dirty: bool = false;
+
+        const row_data = self.row_data.slice();
+        const row_arenas = row_data.items(.arena);
+        const row_dirties = row_data.items(.dirty);
+        const row_pins = row_data.items(.pin);
+        const row_highlights_slice = row_data.items(.highlights);
+        for (
+            row_arenas,
+            row_pins,
+            row_highlights_slice,
+            row_dirties,
+        ) |*row_arena, row_pin, *row_highlights, *dirty| {
+            for (hls) |hl| {
+                const chunks_slice = hl.chunks.slice();
+                const nodes = chunks_slice.items(.node);
+                const starts = chunks_slice.items(.start);
+                const ends = chunks_slice.items(.end);
+                for (0.., nodes) |i, node| {
+                    // If this node doesn't match or we're not within
+                    // the row range, skip it.
+                    if (node != row_pin.node or
+                        row_pin.y < starts[i] or
+                        row_pin.y >= ends[i]) continue;
+
+                    // We're a match!
+                    var arena = row_arena.promote(alloc);
+                    defer row_arena.* = arena.state;
+                    const arena_alloc = arena.allocator();
+                    try row_highlights.append(
+                        arena_alloc,
+                        .{
+                            .tag = tag,
+                            .range = .{
+                                if (i == 0 and
+                                    row_pin.y == starts[0])
+                                    hl.top_x
+                                else
+                                    0,
+                                if (i == nodes.len - 1 and
+                                    row_pin.y == ends[nodes.len - 1] - 1)
+                                    hl.bot_x
+                                else
+                                    self.cols - 1,
+                            },
+                        },
+                    );
+
+                    dirty.* = true;
+                    any_dirty = true;
+                }
+            }
+        }
+
+        // Mark our dirty state.
+        if (any_dirty and self.dirty == .false) self.dirty = .partial;
     }
 
     pub const StringMap = std.ArrayListUnmanaged(point.Coordinate);
@@ -1216,4 +1315,63 @@ test "string" {
 
     const expected = "AB\x00\x00\x00\n\x00\x00\x00\x00\x00\n";
     try testing.expectEqualStrings(expected, result);
+}
+
+test "dirty row resets highlights" {
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    var t = try Terminal.init(alloc, .{
+        .cols = 10,
+        .rows = 3,
+    });
+    defer t.deinit(alloc);
+
+    var s = t.vtStream();
+    defer s.deinit();
+    try s.nextSlice("ABC");
+
+    var state: RenderState = .empty;
+    defer state.deinit(alloc);
+    try state.update(alloc, &t);
+
+    // Reset dirty state
+    state.dirty = .false;
+    {
+        const row_data = state.row_data.slice();
+        const dirty = row_data.items(.dirty);
+        @memset(dirty, false);
+    }
+
+    // Manually add a highlight to row 0
+    {
+        const row_data = state.row_data.slice();
+        const row_arenas = row_data.items(.arena);
+        const row_highlights = row_data.items(.highlights);
+        var arena = row_arenas[0].promote(alloc);
+        defer row_arenas[0] = arena.state;
+        try row_highlights[0].append(arena.allocator(), .{
+            .tag = 1,
+            .range = .{ 0, 2 },
+        });
+    }
+
+    // Verify we have a highlight
+    {
+        const row_data = state.row_data.slice();
+        const row_highlights = row_data.items(.highlights);
+        try testing.expectEqual(1, row_highlights[0].items.len);
+    }
+
+    // Write to row 0 to make it dirty
+    try s.nextSlice("\x1b[H"); // Move to home
+    try s.nextSlice("X");
+    try state.update(alloc, &t);
+
+    // Verify the highlight was reset on the dirty row
+    {
+        const row_data = state.row_data.slice();
+        const row_highlights = row_data.items(.highlights);
+        try testing.expectEqual(0, row_highlights[0].items.len);
+    }
 }

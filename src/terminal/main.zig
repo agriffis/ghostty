@@ -1,10 +1,7 @@
-const builtin = @import("builtin");
-
 const charsets = @import("charsets.zig");
 const stream = @import("stream.zig");
 const ansi = @import("ansi.zig");
 const csi = @import("csi.zig");
-const hyperlink = @import("hyperlink.zig");
 const render = @import("render.zig");
 const stream_readonly = @import("stream_readonly.zig");
 const style = @import("style.zig");
@@ -15,6 +12,7 @@ pub const point = @import("point.zig");
 pub const color = @import("color.zig");
 pub const device_status = @import("device_status.zig");
 pub const formatter = @import("formatter.zig");
+pub const highlight = @import("highlight.zig");
 pub const kitty = @import("kitty.zig");
 pub const modes = @import("modes.zig");
 pub const page = @import("page.zig");

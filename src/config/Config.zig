@@ -29,8 +29,6 @@ const formatterpkg = @import("formatter.zig");
 const themepkg = @import("theme.zig");
 const url = @import("url.zig");
 const Key = @import("key.zig").Key;
-const KeyValue = @import("key.zig").Value;
-const ErrorList = @import("ErrorList.zig");
 const MetricModifier = fontpkg.Metrics.Modifier;
 const help_strings = @import("help_strings");
 pub const Command = @import("command.zig").Command;
@@ -977,6 +975,35 @@ palette: Palette = .{},
 ///
 /// Available since: 1.1.0
 @"split-divider-color": ?Color = null,
+
+/// The foreground and background color for search matches. This only applies
+/// to non-focused search matches, also known as candidate matches.
+///
+/// Valid values:
+///
+///   - Hex (`#RRGGBB` or `RRGGBB`)
+///   - Named X11 color
+///   - "cell-foreground" to match the cell foreground color
+///   - "cell-background" to match the cell background color
+///
+/// The default value is black text on a golden yellow background.
+@"search-foreground": TerminalColor = .{ .color = .{ .r = 0, .g = 0, .b = 0 } },
+@"search-background": TerminalColor = .{ .color = .{ .r = 0xFF, .g = 0xE0, .b = 0x82 } },
+
+/// The foreground and background color for the currently selected search match.
+/// This is the focused match that will be jumped to when using next/previous
+/// search navigation.
+///
+/// Valid values:
+///
+///   - Hex (`#RRGGBB` or `RRGGBB`)
+///   - Named X11 color
+///   - "cell-foreground" to match the cell foreground color
+///   - "cell-background" to match the cell background color
+///
+/// The default value is black text on a soft peach background.
+@"search-selected-foreground": TerminalColor = .{ .color = .{ .r = 0, .g = 0, .b = 0 } },
+@"search-selected-background": TerminalColor = .{ .color = .{ .r = 0xF2, .g = 0xA5, .b = 0x7E } },
 
 /// The command to run, usually a shell. If this is not an absolute path, it'll
 /// be looked up in the `PATH`. If this is not set, a default will be looked up
@@ -6071,6 +6098,20 @@ pub const Keybinds = struct {
                 .{ .jump_to_prompt = 1 },
             );
 
+            // Search
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'f' }, .mods = .{ .ctrl = true, .shift = true } },
+                .start_search,
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .escape } },
+                .end_search,
+                .{ .performable = true },
+            );
+
             // Inspector, matching Chromium
             try self.set.put(
                 alloc,
@@ -6372,6 +6413,38 @@ pub const Keybinds = struct {
                 alloc,
                 .{ .key = .{ .physical = .arrow_down }, .mods = .{ .super = true } },
                 .{ .jump_to_prompt = 1 },
+            );
+
+            // Search
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'f' }, .mods = .{ .super = true } },
+                .start_search,
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'f' }, .mods = .{ .super = true, .shift = true } },
+                .end_search,
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .physical = .escape } },
+                .end_search,
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'g' }, .mods = .{ .super = true } },
+                .{ .navigate_search = .next },
+                .{ .performable = true },
+            );
+            try self.set.putFlags(
+                alloc,
+                .{ .key = .{ .unicode = 'g' }, .mods = .{ .super = true, .shift = true } },
+                .{ .navigate_search = .previous },
+                .{ .performable = true },
             );
 
             // Inspector, matching Chromium
