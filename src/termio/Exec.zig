@@ -27,6 +27,7 @@ const Pty = ptypkg.Pty;
 const EnvMap = std.process.EnvMap;
 const PasswdEntry = internal_os.passwd.Entry;
 const windows = internal_os.windows;
+const ProcessInfo = @import("../pty.zig").ProcessInfo;
 
 const log = std.log.scoped(.io_exec);
 
@@ -562,10 +563,13 @@ pub const Config = struct {
     env_override: configpkg.RepeatableStringMap = .{},
     shell_integration: configpkg.Config.ShellIntegration = .detect,
     shell_integration_features: configpkg.Config.ShellIntegrationFeatures = .{},
+    cursor_blink: ?bool = null,
     working_directory: ?[]const u8 = null,
     resources_dir: ?[]const u8,
     term: []const u8,
-    linux_cgroup: Command.LinuxCgroup = Command.linux_cgroup_default,
+
+    rt_pre_exec_info: Command.RtPreExecInfo,
+    rt_post_fork_info: Command.RtPostForkInfo,
 };
 
 const Subprocess = struct {
@@ -583,7 +587,9 @@ const Subprocess = struct {
     screen_size: renderer.ScreenSize,
     pty: ?Pty = null,
     process: ?Process = null,
-    linux_cgroup: Command.LinuxCgroup = Command.linux_cgroup_default,
+
+    rt_pre_exec_info: Command.RtPreExecInfo,
+    rt_post_fork_info: Command.RtPostForkInfo,
 
     /// Union that represents the running process type.
     const Process = union(enum) {
@@ -750,15 +756,16 @@ const Subprocess = struct {
                     else => "sh",
                 } };
 
+            // Always set up shell features (GHOSTTY_SHELL_FEATURES). These are
+            // used by both automatic and manual shell integrations.
+            try shell_integration.setupFeatures(
+                &env,
+                cfg.shell_integration_features,
+                cfg.cursor_blink orelse true,
+            );
+
             const force: ?shell_integration.Shell = switch (cfg.shell_integration) {
                 .none => {
-                    // Even if shell integration is none, we still want to
-                    // set up the feature env vars
-                    try shell_integration.setupFeatures(
-                        &env,
-                        cfg.shell_integration_features,
-                    );
-
                     // This is a source of confusion for users despite being
                     // opt-in since it results in some Ghostty features not
                     // working. We always want to log it.
@@ -770,6 +777,7 @@ const Subprocess = struct {
                 .bash => .bash,
                 .elvish => .elvish,
                 .fish => .fish,
+                .nushell => .nushell,
                 .zsh => .zsh,
             };
 
@@ -784,7 +792,6 @@ const Subprocess = struct {
                 default_shell_command,
                 &env,
                 force,
-                cfg.shell_integration_features,
             ) orelse {
                 log.warn("shell could not be detected, no automatic shell integration will be injected", .{});
                 break :shell default_shell_command;
@@ -849,21 +856,14 @@ const Subprocess = struct {
         // https://github.com/ghostty-org/ghostty/discussions/7769
         if (cwd) |pwd| try env.put("PWD", pwd);
 
-        // If we have a cgroup, then we copy that into our arena so the
-        // memory remains valid when we start.
-        const linux_cgroup: Command.LinuxCgroup = cgroup: {
-            const default = Command.linux_cgroup_default;
-            if (comptime builtin.os.tag != .linux) break :cgroup default;
-            const path = cfg.linux_cgroup orelse break :cgroup default;
-            break :cgroup try alloc.dupe(u8, path);
-        };
-
         return .{
             .arena = arena,
             .env = env,
             .cwd = cwd,
             .args = args,
-            .linux_cgroup = linux_cgroup,
+
+            .rt_pre_exec_info = cfg.rt_pre_exec_info,
+            .rt_post_fork_info = cfg.rt_post_fork_info,
 
             // Should be initialized with initTerminal call.
             .grid_size = .{},
@@ -1012,17 +1012,27 @@ const Subprocess = struct {
             .stdout = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
             .stderr = if (builtin.os.tag == .windows) null else .{ .handle = pty.slave },
             .pseudo_console = if (builtin.os.tag == .windows) pty.pseudo_console else {},
-            .pre_exec = if (builtin.os.tag == .windows) null else (struct {
-                fn callback(cmd: *Command) void {
-                    const sp = cmd.getData(Subprocess) orelse unreachable;
-                    sp.childPreExec() catch |err| log.err(
-                        "error initializing child: {}",
-                        .{err},
-                    );
-                }
-            }).callback,
+            .os_pre_exec = switch (comptime builtin.os.tag) {
+                .windows => null,
+                else => f: {
+                    const f = struct {
+                        fn callback(cmd: *Command) ?u8 {
+                            const sp = cmd.getData(Subprocess) orelse unreachable;
+                            sp.childPreExec() catch |err| log.err(
+                                "error initializing child: {}",
+                                .{err},
+                            );
+                            return null;
+                        }
+                    };
+                    break :f f.callback;
+                },
+            },
+            .rt_pre_exec = if (comptime @hasDecl(apprt.runtime, "pre_exec")) apprt.runtime.pre_exec.preExec else null,
+            .rt_pre_exec_info = self.rt_pre_exec_info,
+            .rt_post_fork = if (comptime @hasDecl(apprt.runtime, "post_fork")) apprt.runtime.post_fork.postFork else null,
+            .rt_post_fork_info = self.rt_post_fork_info,
             .data = self,
-            .linux_cgroup = self.linux_cgroup,
         };
 
         cmd.start(alloc) catch |err| {
@@ -1044,9 +1054,6 @@ const Subprocess = struct {
             log.warn("error killing command during cleanup err={}", .{err});
         };
         log.info("started subcommand path={s} pid={?}", .{ self.args[0], cmd.pid });
-        if (comptime builtin.os.tag == .linux) {
-            log.info("subcommand cgroup={s}", .{self.linux_cgroup orelse "-"});
-        }
 
         self.process = .{ .fork_exec = cmd };
         return switch (builtin.os.tag) {
@@ -1219,6 +1226,14 @@ const Subprocess = struct {
     /// This sends a signal via the Flatpak API.
     fn killCommandFlatpak(command: *FlatpakHostCommand) !void {
         try command.signal(c.SIGHUP, true);
+    }
+
+    /// Get information about the process(es) running within the subprocess.
+    /// Returns `null` if there was an error getting the information or the
+    /// information is not available on a particular platform.
+    pub fn getProcessInfo(self: *Subprocess, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+        const pty = &(self.pty orelse return null);
+        return pty.getProcessInfo(info);
     }
 };
 
@@ -1572,6 +1587,13 @@ fn execCommand(
             break :shell try args.toOwnedSlice(alloc);
         },
     };
+}
+
+/// Get information about the process(es) running within the backend. Returns
+/// `null` if there was an error getting the information or the information is
+/// not available on a particular platform.
+pub fn getProcessInfo(self: *Exec, comptime info: ProcessInfo) ?ProcessInfo.Type(info) {
+    return self.subprocess.getProcessInfo(info);
 }
 
 test "execCommand darwin: shell command" {

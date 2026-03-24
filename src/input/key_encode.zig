@@ -153,13 +153,13 @@ fn kitty(
 
         // IME confirmation still sends an enter key so if we have enter
         // and UTF8 text we just send it directly since we assume that is
-        // whats happening. See legacy()'s similar logic for more details
+        // what's happening. See legacy()'s similar logic for more details
         // on how to verify this.
         if (event.utf8.len > 0) utf8: {
             switch (event.key) {
                 else => {},
                 inline .enter, .backspace => |tag| {
-                    // See legacy for why we handle this this way.
+                    // See legacy for why we handle this way.
                     if (isControlUtf8(event.utf8)) break :utf8;
                     if (comptime tag == .backspace) return;
                     return try writer.writeAll(event.utf8);
@@ -178,7 +178,7 @@ fn kitty(
             // Quote ("report all" mode):
             // Note that all keys are reported as escape codes, including Enter,
             // Tab, Backspace etc.
-            if (effective_mods.empty()) {
+            if (binding_mods.empty()) {
                 switch (event.key) {
                     .enter => return try writer.writeByte('\r'),
                     .tab => return try writer.writeByte('\t'),
@@ -214,7 +214,13 @@ fn kitty(
         }
     }
 
-    const entry = entry_ orelse return;
+    const entry = entry_ orelse {
+        // No entry found. If we have UTF-8 text this is a pure text event
+        // (e.g. composed/IME text), so send it as-is so programs can
+        // still receive it.
+        if (event.utf8.len > 0) return try writer.writeAll(event.utf8);
+        return;
+    };
 
     // If this is just a modifier we require "report all" to send the sequence.
     if (entry.modifier and !opts.kitty_flags.report_all) return;
@@ -1311,7 +1317,48 @@ test "kitty: enter, backspace, tab" {
         try testing.expectEqualStrings("\x1b[9;1:3u", writer.buffered());
     }
 }
-//
+
+test "kitty: shift+backspace emits CSI u" {
+    // Backspace with shift modifier should emit CSI u sequence, not raw 0x7F.
+    // This is important for programs that want to distinguish shift+backspace.
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .backspace,
+        .mods = .{ .shift = true },
+        .utf8 = "",
+    }, .{
+        .kitty_flags = .{ .disambiguate = true },
+    });
+    try testing.expectEqualStrings("\x1b[127;2u", writer.buffered());
+}
+
+test "kitty: shift+enter emits CSI u" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .enter,
+        .mods = .{ .shift = true },
+        .utf8 = "",
+    }, .{
+        .kitty_flags = .{ .disambiguate = true },
+    });
+    try testing.expectEqualStrings("\x1b[13;2u", writer.buffered());
+}
+
+test "kitty: shift+tab emits CSI u" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .tab,
+        .mods = .{ .shift = true },
+        .utf8 = "",
+    }, .{
+        .kitty_flags = .{ .disambiguate = true },
+    });
+    try testing.expectEqualStrings("\x1b[9;2u", writer.buffered());
+}
+
 test "kitty: enter with all flags" {
     var buf: [128]u8 = undefined;
     var writer: std.Io.Writer = .fixed(&buf);
@@ -1400,6 +1447,25 @@ test "kitty: composing with modifier" {
         .kitty_flags = .{ .disambiguate = true, .report_all = true },
     });
     try testing.expectEqualStrings("\x1b[57441;2u", writer.buffered());
+}
+
+test "kitty: composed text with report all" {
+    var buf: [128]u8 = undefined;
+    var writer: std.Io.Writer = .fixed(&buf);
+    try kitty(&writer, .{
+        .key = .unidentified,
+        .mods = .{},
+        .utf8 = "\xc3\xbb", // û
+    }, .{
+        .kitty_flags = .{
+            .disambiguate = true,
+            .report_events = true,
+            .report_alternates = true,
+            .report_all = true,
+            .report_associated = true,
+        },
+    });
+    try testing.expectEqualStrings("\xc3\xbb", writer.buffered());
 }
 
 test "kitty: shift+a on US keyboard" {

@@ -8,6 +8,7 @@
   appstream,
   flatpak-builder,
   gdb,
+  cmake,
   #, glxinfo # unused
   ncurses,
   nodejs,
@@ -26,6 +27,7 @@
   wasmtime,
   wraptest,
   zig,
+  zig_0_15,
   zip,
   llvmPackages_latest,
   bzip2,
@@ -65,12 +67,12 @@
   poop,
   typos,
   shellcheck,
+  swiftlint,
   uv,
   wayland,
   wayland-scanner,
   wayland-protocols,
   zon2nix,
-  system,
   pkgs,
   # needed by GTK for loading SVG icons while running from within the
   # developer shell
@@ -90,6 +92,7 @@ in
     packages =
       [
         # For builds
+        cmake
         doxygen
         jq
         llvmPackages_latest.llvm
@@ -100,7 +103,7 @@ in
         scdoc
         zig
         zip
-        zon2nix.packages.${system}.zon2nix
+        zon2nix.packages.${stdenv.hostPlatform.system}.zon2nix
 
         # For web and wasm stuff
         nodejs
@@ -198,6 +201,9 @@ in
 
         # for benchmarking
         poop
+      ]
+      ++ lib.optionals stdenv.hostPlatform.isDarwin [
+        swiftlint
       ];
 
     # This should be set onto the rpath of the ghostty binary if you want

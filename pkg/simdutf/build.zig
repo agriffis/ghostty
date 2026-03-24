@@ -12,12 +12,25 @@ pub fn build(b: *std.Build) !void {
         }),
         .linkage = .static,
     });
-    lib.linkLibCpp();
+    lib.linkLibC();
+    // On MSVC, we must not use linkLibCpp because Zig unconditionally
+    // passes -nostdinc++ and then adds its bundled libc++/libc++abi
+    // include paths, which conflict with MSVC's own C++ runtime headers.
+    // The MSVC SDK include directories (added via linkLibC) contain
+    // both C and C++ headers, so linkLibCpp is not needed.
+    if (target.result.abi != .msvc) {
+        lib.linkLibCpp();
+    }
     lib.addIncludePath(b.path("vendor"));
 
     if (target.result.os.tag.isDarwin()) {
         const apple_sdk = @import("apple_sdk");
         try apple_sdk.addPaths(b, lib);
+    }
+
+    if (target.result.abi.isAndroid()) {
+        const android_ndk = @import("android_ndk");
+        try android_ndk.addPaths(b, lib);
     }
 
     var flags: std.ArrayList([]const u8) = .empty;
@@ -31,6 +44,10 @@ pub fn build(b: *std.Build) !void {
         "-fno-sanitize=undefined",
         "-fno-sanitize-trap=undefined",
     });
+
+    if (target.result.os.tag == .freebsd or target.result.abi == .musl) {
+        try flags.append(b.allocator, "-fPIC");
+    }
 
     lib.addCSourceFiles(.{
         .flags = flags.items,

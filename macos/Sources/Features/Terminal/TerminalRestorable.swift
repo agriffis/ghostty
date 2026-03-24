@@ -1,20 +1,22 @@
 import Cocoa
 
-/// The state stored for terminal window restoration.
-class TerminalRestorableState: Codable {
-    static let selfKey = "state"
-    static let versionKey = "version"
-    static let version: Int = 5
+protocol TerminalRestorable: Codable {
+    static var selfKey: String { get }
+    static var versionKey: String { get }
+    static var version: Int { get }
+    init(copy other: Self)
 
-    let focusedSurface: String?
-    let surfaceTree: SplitTree<Ghostty.SurfaceView>
-    let effectiveFullscreenMode: FullscreenMode?
+    /// Returns a base configuration to use when restoring terminal surfaces.
+    /// Override this to provide custom environment variables or other configuration.
+    var baseConfig: Ghostty.SurfaceConfiguration? { get }
+}
 
-    init(from controller: TerminalController) {
-        self.focusedSurface = controller.focusedSurface?.id.uuidString
-        self.surfaceTree = controller.surfaceTree
-        self.effectiveFullscreenMode = controller.fullscreenStyle?.fullscreenMode
-    }
+extension TerminalRestorable {
+    static var selfKey: String { "state" }
+    static var versionKey: String { "version" }
+
+    /// Default implementation returns nil (no custom base config).
+    var baseConfig: Ghostty.SurfaceConfiguration? { nil }
 
     init?(coder aDecoder: NSCoder) {
         // If the version doesn't match then we can't decode. In the future we can perform
@@ -28,14 +30,39 @@ class TerminalRestorableState: Codable {
             return nil
         }
 
-        self.surfaceTree = v.value.surfaceTree
-        self.focusedSurface = v.value.focusedSurface
-        self.effectiveFullscreenMode = v.value.effectiveFullscreenMode
+        self.init(copy: v.value)
     }
 
     func encode(with coder: NSCoder) {
         coder.encode(Self.version, forKey: Self.versionKey)
         coder.encode(CodableBridge(self), forKey: Self.selfKey)
+    }
+}
+
+/// The state stored for terminal window restoration.
+class TerminalRestorableState: TerminalRestorable {
+    class var version: Int { 7 }
+
+    let focusedSurface: String?
+    let surfaceTree: SplitTree<Ghostty.SurfaceView>
+    let effectiveFullscreenMode: FullscreenMode?
+    let tabColor: TerminalTabColor
+    let titleOverride: String?
+
+    init(from controller: TerminalController) {
+        self.focusedSurface = controller.focusedSurface?.id.uuidString
+        self.surfaceTree = controller.surfaceTree
+        self.effectiveFullscreenMode = controller.fullscreenStyle?.fullscreenMode
+        self.tabColor = (controller.window as? TerminalWindow)?.tabColor ?? .none
+        self.titleOverride = controller.titleOverride
+    }
+
+    required init(copy other: TerminalRestorableState) {
+        self.surfaceTree = other.surfaceTree
+        self.focusedSurface = other.focusedSurface
+        self.effectiveFullscreenMode = other.effectiveFullscreenMode
+        self.tabColor = other.tabColor
+        self.titleOverride = other.titleOverride
     }
 }
 
@@ -71,7 +98,7 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // no matter what. Note its safe to use "ghostty.config" directly here
         // because window restoration is only ever invoked on app start so we
         // don't have to deal with config reloads.
-        if (appDelegate.ghostty.config.windowSaveState == "never") {
+        if appDelegate.ghostty.config.windowSaveState == "never" {
             completionHandler(nil, nil)
             return
         }
@@ -94,17 +121,21 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             return
         }
 
+        // Restore our tab color
+        (window as? TerminalWindow)?.tabColor = state.tabColor
+
+        // Restore the tab title override
+        c.titleOverride = state.titleOverride
+
         // Setup our restored state on the controller
         // Find the focused surface in surfaceTree
         if let focusedStr = state.focusedSurface {
             var foundView: Ghostty.SurfaceView?
-            for view in c.surfaceTree {
-                if view.id.uuidString == focusedStr {
-                    foundView = view
-                    break
-                }
+            for view in c.surfaceTree where view.id.uuidString == focusedStr {
+                foundView = view
+                break
             }
-            
+
             if let view = foundView {
                 c.focusedSurface = view
                 restoreFocus(to: view, inWindow: window)
@@ -128,9 +159,9 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
         // For the first attempt, we schedule it immediately. Subsequent events wait a bit
         // so we don't just spin the CPU at 100%. Give up after some period of time.
         let after: DispatchTime
-        if (attempts == 0) {
+        if attempts == 0 {
             after = .now()
-        } else if (attempts > 40) {
+        } else if attempts > 40 {
             // 2 seconds, give up
             return
         } else {
@@ -152,9 +183,10 @@ class TerminalWindowRestoration: NSObject, NSWindowRestoration {
             // If the window is main, then we also make sure it comes forward. This
             // prevents a bug found in #1177 where sometimes on restore the windows
             // would be behind other applications.
-            if (viewWindow.isMainWindow) {
+            if viewWindow.isMainWindow {
                 viewWindow.orderFront(nil)
             }
         }
     }
 }
+
