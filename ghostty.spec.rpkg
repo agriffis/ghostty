@@ -72,6 +72,9 @@ zig build \
 rm -rf "%{buildroot}%{_datadir}/terminfo"
 %endif
 
+# Remove libghostty which doesn't pertain yet.
+rm -f "%{buildroot}/usr/lib/libghostty"*
+
 # Find the files because manually listing them is boring.
 find "%{buildroot}" -type f | \
 sed 's,^%{buildroot},,' | \
