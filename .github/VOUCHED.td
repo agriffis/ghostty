@@ -45,6 +45,7 @@ bitigchi
 bkircher
 bo2themax
 brentschroeter
+brianc442
 cespare
 charliie-dev
 chernetskyi
@@ -147,6 +148,7 @@ noib3
 nwehg
 ocean6954
 oshdubh
+paaloeye
 pan93412
 pangoraw
 pauley-unsaturated
