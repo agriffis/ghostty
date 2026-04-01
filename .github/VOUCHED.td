@@ -59,6 +59,7 @@ d-dudas
 -daedaevibin
 daiimus
 damyanbogoev
+danneu
 danulqua
 dariogriffo
 davidsanchez222
@@ -99,6 +100,7 @@ icodesign
 j0hnm4r5
 jacobsandlund
 jake-stewart
+jarred-sumner
 jcollie
 jesusvazquez
 jguthmiller
