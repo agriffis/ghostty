@@ -71,6 +71,7 @@ dmehala
 doprz
 douglance
 douglas
+douglas-macgregor
 drepper
 dzhlobo
 ekaterinepapava
@@ -87,6 +88,7 @@ gmile
 gordonbondon
 gpanders
 guilhermetk
+h3nock
 hakonhagland
 halosatrio
 heaths
