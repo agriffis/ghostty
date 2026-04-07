@@ -8,6 +8,20 @@ pub const color = @import("color.zig");
 pub const focus = @import("focus.zig");
 pub const formatter = @import("formatter.zig");
 pub const grid_ref = @import("grid_ref.zig");
+pub const kitty_graphics = @import("kitty_graphics.zig");
+pub const kitty_graphics_get = kitty_graphics.get;
+pub const kitty_graphics_image = kitty_graphics.image_get_handle;
+pub const kitty_graphics_image_get = kitty_graphics.image_get;
+pub const kitty_graphics_placement_iterator_new = kitty_graphics.placement_iterator_new;
+pub const kitty_graphics_placement_iterator_free = kitty_graphics.placement_iterator_free;
+pub const kitty_graphics_placement_iterator_set = kitty_graphics.placement_iterator_set;
+pub const kitty_graphics_placement_next = kitty_graphics.placement_iterator_next;
+pub const kitty_graphics_placement_get = kitty_graphics.placement_get;
+pub const kitty_graphics_placement_rect = kitty_graphics.placement_rect;
+pub const kitty_graphics_placement_pixel_size = kitty_graphics.placement_pixel_size;
+pub const kitty_graphics_placement_grid_size = kitty_graphics.placement_grid_size;
+pub const kitty_graphics_placement_viewport_pos = kitty_graphics.placement_viewport_pos;
+pub const kitty_graphics_placement_source_rect = kitty_graphics.placement_source_rect;
 pub const types = @import("types.zig");
 pub const modes = @import("modes.zig");
 pub const osc = @import("osc.zig");
@@ -22,6 +36,7 @@ pub const row = @import("row.zig");
 pub const sgr = @import("sgr.zig");
 pub const size_report = @import("size_report.zig");
 pub const style = @import("style.zig");
+pub const sys = @import("sys.zig");
 pub const terminal = @import("terminal.zig");
 
 // The full C API, unexported.
@@ -132,6 +147,8 @@ pub const row_get = row.get;
 pub const style_default = style.default_style;
 pub const style_is_default = style.style_is_default;
 
+pub const sys_set = sys.set;
+
 pub const terminal_new = terminal.new;
 pub const terminal_free = terminal.free;
 pub const terminal_reset = terminal.reset;
@@ -143,6 +160,7 @@ pub const terminal_mode_get = terminal.mode_get;
 pub const terminal_mode_set = terminal.mode_set;
 pub const terminal_get = terminal.get;
 pub const terminal_grid_ref = terminal.grid_ref;
+pub const terminal_point_from_grid_ref = terminal.point_from_grid_ref;
 
 pub const type_json = types.get_json;
 
@@ -158,6 +176,7 @@ test {
     _ = cell;
     _ = color;
     _ = grid_ref;
+    _ = kitty_graphics;
     _ = row;
     _ = focus;
     _ = formatter;
@@ -173,6 +192,7 @@ test {
     _ = sgr;
     _ = size_report;
     _ = style;
+    _ = sys;
     _ = terminal;
     _ = types;
 
