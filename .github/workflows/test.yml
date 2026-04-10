@@ -278,6 +278,10 @@ jobs:
       fail-fast: false
       matrix:
         dir: ${{ fromJSON(needs.list-examples.outputs.cmake) }}
+        exclude:
+          # Cross-compilation from Windows requires /bin/sh for zig's
+          # combine-archives step, which is not available on Windows.
+          - dir: c-vt-cmake-cross
     name: Example ${{ matrix.dir }} (Windows)
     runs-on: namespace-profile-ghostty-windows
     timeout-minutes: 45

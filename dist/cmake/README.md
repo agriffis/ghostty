@@ -62,6 +62,22 @@ target_link_libraries(myapp PRIVATE ghostty-vt::ghostty-vt)
 - `ghostty-vt-config.cmake.in` — template for the CMake package config
   file installed alongside the library, enabling `find_package()` support.
 
-## Example
+## Cross-compilation
 
-See `example/c-vt-cmake/` for a complete working example.
+For cross-compiling to a different Zig target triple, use
+`ghostty_vt_add_target()` after `FetchContent_MakeAvailable`:
+
+```cmake
+FetchContent_MakeAvailable(ghostty)
+ghostty_vt_add_target(NAME linux-amd64 ZIG_TARGET x86_64-linux-gnu)
+
+add_executable(myapp main.c)
+target_link_libraries(myapp PRIVATE ghostty-vt-static-linux-amd64)
+```
+
+See `example/c-vt-cmake-cross/` for a complete working example.
+
+## Examples
+
+- `example/c-vt-cmake/` — native build using FetchContent
+- `example/c-vt-cmake-cross/` — cross-compilation using `ghostty_vt_add_target()`
