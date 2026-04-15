@@ -419,8 +419,9 @@ jobs:
           echo "Libs:   $(pkg-config --libs libghostty-vt)"
           echo "Static: $(pkg-config --libs --static libghostty-vt)"
 
-          # Libs.private must include the C++ standard library
-          pkg-config --libs --static libghostty-vt | grep -q -- '-lc++'
+          # Libs.private must NOT include the C++ standard library (all
+          # C++ deps are built in no-libcxx mode).
+          ! pkg-config --libs --static libghostty-vt | grep -q -- '-lc++'
 
       - name: Verify static archive contains SIMD deps
         run: |
