@@ -20,6 +20,7 @@
 # "!denounce" or "!denounce [username]" on a discussion.
 00-kat
 007hacky007
+00jciv00
 04cb
 0xdvc
 -4rh1t3ct0r7
@@ -43,6 +44,7 @@ andrejdaskalov
 anhthang
 anmitalidev
 anthonyzhoon
+athaapa
 atomk
 balazs-szucs
 barutsrb
@@ -233,6 +235,7 @@ sunshine-syz
 tbrundige
 tdgroot
 tdslot
+thirstycrow
 thoutbeckers
 ticclick
 tnagatomi
