@@ -46,6 +46,7 @@ anmitalidev
 anthonyzhoon
 athaapa
 atomk
+b0uks
 b1nar10
 balazs-szucs
 barutsrb
@@ -179,6 +180,7 @@ misairuzame
 mischief
 mitchellh
 miupa
+mjbommar
 mohshami
 molechowski
 moonmao42
@@ -218,6 +220,7 @@ puzza007
 qwerasd205
 raphamorim
 reo101
+rewdy
 rgehan
 rhodes-b
 rightaditya
