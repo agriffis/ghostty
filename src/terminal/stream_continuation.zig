@@ -4,6 +4,84 @@ const Allocator = std.mem.Allocator;
 const Parser = @import("Parser.zig");
 const UTF8Decoder = @import("UTF8Decoder.zig");
 
+/// Errors possible while validating a snapshot continuation.
+pub const ValidateError = error{
+    /// Nonempty input left both the VT parser and UTF-8 decoder at ground.
+    ///
+    /// A continuation exists only to reconstruct state that was unfinished at
+    /// the snapshot cut. Input that returns to ground is a complete PTY
+    /// fragment, not a continuation. Replaying it would repeat work already
+    /// represented by the Terminal snapshot. For example, `ESC [ 3 1 m`
+    /// completes an SGR command and must not be stored as a continuation.
+    NoPendingState,
+
+    /// The input does not begin at its effective replay start.
+    ///
+    /// A later ESC supersedes earlier VT parser state, and a pending UTF-8
+    /// codepoint begins at its lead byte. Any prefix before that effective
+    /// start is unnecessary and would disappear when the restored Stream
+    /// exports its continuation again. Rejecting the prefix preserves the
+    /// byte-identical re-export invariant and prevents unrelated prior input
+    /// from being replayed.
+    NonCanonicalContinuation,
+
+    /// Replaying the input would perform handler-visible work.
+    ///
+    /// The Terminal snapshot already contains every mutation committed before
+    /// its capture cut. A continuation may rebuild unfinished parser or
+    /// builder state, but it must not mutate the Terminal or repeat an external
+    /// effect while doing so. For example, BEL inside an unfinished CSI would
+    /// ring again even though the CSI itself remains pending.
+    ReplayWouldCommit,
+};
+
+/// Validate bytes exported for replay by the standard TerminalStream.
+///
+/// A Terminal snapshot contains durable terminal state, but it does not contain
+/// the Stream's private VT parser or UTF-8 decoder state. A continuation fills
+/// only that gap: replaying it into a fresh Stream at ground must reconstruct
+/// the unfinished state at the same cut without repeating any work already
+/// captured by the Terminal.
+///
+/// Empty input is valid and means that both state machines should remain at
+/// ground. Nonempty input is valid only when all of these conditions hold:
+///
+///   - replay ends with either VT or UTF-8 state unfinished;
+///   - byte zero is the effective start needed to reconstruct that state; and
+///   - replay commits no Terminal mutation or external handler effect.
+///
+/// The checks below are intentionally ordered. We report `NoPendingState` for
+/// complete input and `NonCanonicalContinuation` for a superseded prefix even
+/// if those bytes also committed work. The scanner must therefore consume the
+/// complete input while remembering whether any committed work occurred.
+pub fn validate(bytes: []const u8) ValidateError!void {
+    // Empty explicitly requests ground state and needs no replay.
+    if (bytes.len == 0) return;
+
+    // We need the final parser and decoder states to classify the input, so a
+    // committed byte cannot return early. Remember it while scanning the rest.
+    var scanner: BoundaryScanner = .init();
+    var committed_work = false;
+    for (bytes) |byte| {
+        if (scanner.next(byte) != .uncommitted) committed_work = true;
+    }
+
+    // Nonempty continuation bytes must leave state that future input needs.
+    if (scanner.ground()) return error.NoPendingState;
+
+    // The tracker exports the minimal suffix beginning at the effective replay
+    // start. A different prefix would not survive byte-identical re-export.
+    const replay_start = if (scanner.parser.state != .ground)
+        findVTReplayStart(bytes)
+    else
+        findUtf8ReplayStart(bytes);
+    if (replay_start != 0) return error.NonCanonicalContinuation;
+
+    // At this point the input is unfinished and minimal, but replay must also
+    // be inert with respect to the already-restored Terminal and its effects.
+    if (committed_work) return error.ReplayWouldCommit;
+}
+
 /// Retains the input needed to reconstruct unfinished Stream parser state.
 ///
 /// A feed is one chunk of bytes given to a Stream. It can end in the middle of
