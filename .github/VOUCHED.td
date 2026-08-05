@@ -145,7 +145,7 @@ illiakrauchanka
 j0hnm4r5
 jacobsandlund
 jake-stewart
-jamesarch
+-jamesarch Bad AI etiquette
 jamylak
 jarred-sumner
 jcollie
@@ -182,6 +182,7 @@ lepips
 liby
 linustalacko
 lonsagisawa
+lotheac
 louisunlimited
 luisnquin
 lynicis
@@ -292,6 +293,7 @@ turbolent
 tweedbeetle
 uhojin
 unphased
+unsaltedscholar
 uzaaft
 vancluever
 vaughanandrews
