@@ -74,6 +74,7 @@ bo2themax
 bousii
 brentschroeter
 brianc442
+by-nelson
 c0x0o
 carldaws
 carlvillads
@@ -155,6 +156,7 @@ hulet
 i999rri
 icodesign
 illiakrauchanka
+j-c-m
 j0hnm4r5
 jacobsandlund
 jake-stewart
@@ -298,6 +300,7 @@ slsrepo
 steven-tk
 sunshine-syz
 svmhdvn
+-tangivis
 tasselx
 tbrundige
 tdgroot
@@ -306,6 +309,7 @@ thirstycrow
 thoutbeckers
 ticclick
 tnagatomi
+tothedarktowercame
 trag1c
 tristan957
 tsacha
