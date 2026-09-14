@@ -150,11 +150,13 @@ hakonhagland
 halosatrio
 heaths
 heddxh heddxh
+helium777
 -highimpact-dev Disrespectful AI user
 hlcfan
 hqnna
 hulet
 i999rri
+ibaios
 icodesign
 illiakrauchanka
 j-c-m
@@ -260,6 +262,7 @@ pan93412
 pangoraw
 pauley-unsaturated
 pearkes
+pedronaugusto
 peilingjiang
 peterdavehello
 philocalyst
