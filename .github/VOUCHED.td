@@ -86,6 +86,7 @@ chronologos
 cmwetherell
 crayxt
 craziestowl
+cristeahub
 curtismoncoq
 -cznorth Automated advertising + likely AI communication
 d-dudas
@@ -193,6 +194,7 @@ kleshzz
 kloneets
 knu
 -kody-w
+konstantinhudyakov
 koranir
 korikhin
 kostich
