@@ -18,6 +18,7 @@ BuildRequires: gtk4-devel
 BuildRequires: gtk4-layer-shell-devel
 BuildRequires: harfbuzz-devel
 BuildRequires: libadwaita-devel
+BuildRequires: libEGL-devel
 BuildRequires: libpng-devel
 BuildRequires: libxml2-devel
 BuildRequires: oniguruma-devel
