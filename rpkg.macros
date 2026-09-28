@@ -16,13 +16,13 @@ function git_version {
   describe=$(git describe --first-parent --long origin/main)
   read tag commits hash <<<"${describe//-/ }"
   hash=${hash#g} # git prepends g to indicate git
-  if [[ $tag == tip ]]; then
-    # v1.0.1-56-g1baf8928
-    describe=$(git describe --first-parent --long origin/main^)
-    read tag commits _ <<<"${describe//-/ }"
-    tag=${describe%%-*}
-    commits=$(( commits + 1 ))
-  fi
+  while [[ $tag == tip ]]; do
+    # looking for v1.0.1-56-g1baf8928
+    describe=$(git describe --first-parent --long $hash^)
+    read tag tag_commits hash <<<"${describe//-/ }"
+    commits=$(( commits + tag_commits + 1 ))
+    hash=${hash#g} # git prepends g to indicate git
+  done
   [[ $tag == v* && $commits =~ ^[0-9]+$ && -n $hash ]] || abort "failed git describe"
 
   # https://docs.fedoraproject.org/en-US/packaging-guidelines/Versioning/#_snapshots
