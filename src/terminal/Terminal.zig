@@ -14165,6 +14165,25 @@ test "Terminal: eraseLine complete resets wrap" {
     }
 }
 
+test "Terminal: eraseLine complete clears kitty placeholder flag" {
+    if (comptime !build_options.kitty_graphics) return error.SkipZigTest;
+
+    const alloc = testing.allocator;
+    const io_impl = testing.io;
+    var t = try init(io_impl, alloc, .{ .rows = 5, .cols = 5 });
+    defer t.deinit(alloc);
+
+    try t.print(kitty.graphics.unicode.placeholder);
+    {
+        const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+        try testing.expect(list_cell.row.kitty_virtual_placeholder);
+    }
+    t.eraseLine(.complete, false);
+
+    const list_cell = t.screens.active.pages.getCell(.{ .active = .{ .x = 0, .y = 0 } }).?;
+    try testing.expect(!list_cell.row.kitty_virtual_placeholder);
+}
+
 test "Terminal: eraseLine complete protected attributes respected with iso" {
     const alloc = testing.allocator;
     const io_impl = testing.io;
@@ -16126,6 +16145,49 @@ test "Terminal: resize with reflow and saved cursor pending wrap" {
         const str = try t.plainString(testing.allocator);
         defer testing.allocator.free(str);
         try testing.expectEqualStrings("1A2BX", str);
+    }
+}
+
+test "Terminal: resize pending wrap live and saved cursors" {
+    const alloc = testing.allocator;
+    const cases = [_]struct {
+        text: []const u8,
+        cols: size.CellCountInt,
+        pending_wrap: bool,
+        expected: []const u8,
+    }{
+        // Widening leaves room after the formerly full line.
+        .{ .text = "ABCD", .cols = 6, .pending_wrap = false, .expected = "ABCDX" },
+        // Narrowing can move the last character into the middle of a row.
+        .{ .text = "ABCD", .cols = 3, .pending_wrap = false, .expected = "ABC\nDX" },
+        // Keep pending wrap when the last character still fills a row.
+        .{ .text = "ABCD", .cols = 2, .pending_wrap = true, .expected = "AB\nCD\nX" },
+        // A height-only resize also preserves pending wrap.
+        .{ .text = "ABCD", .cols = 4, .pending_wrap = true, .expected = "ABCD\nX" },
+        // Reflow can merge previously wrapped rows.
+        .{ .text = "ABCDEFGH", .cols = 6, .pending_wrap = false, .expected = "ABCDEF\nGHX" },
+        // A wide character at the old right edge must not be overwritten.
+        .{ .text = "AB界", .cols = 6, .pending_wrap = false, .expected = "AB界X" },
+        // A cursor without pending wrap must not advance an extra cell.
+        .{ .text = "ABC", .cols = 6, .pending_wrap = false, .expected = "ABCX" },
+    };
+
+    for (cases) |case| {
+        for ([_]bool{ false, true }) |restore| {
+            var t = try init(testing.io, alloc, .{ .cols = 4, .rows = 5 });
+            defer t.deinit(alloc);
+            try t.printString(case.text);
+            if (restore) t.saveCursor();
+
+            try t.resize(alloc, .{ .cols = case.cols, .rows = 6 });
+            if (restore) t.restoreCursor();
+            try testing.expectEqual(case.pending_wrap, t.screens.active.cursor.pending_wrap);
+
+            try t.print('X');
+            const str = try t.plainString(alloc);
+            defer alloc.free(str);
+            try testing.expectEqualStrings(case.expected, str);
+        }
     }
 }
 
