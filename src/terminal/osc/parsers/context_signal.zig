@@ -433,7 +433,7 @@ test "OSC 3008: max length context ID" {
     const testing = std.testing;
 
     var p: Parser = .init(null);
-    const id = "a" ** 64;
+    const id: [64]u8 = @splat('a');
     const input = "3008;start=" ++ id;
     for (input) |ch| p.next(ch);
 
@@ -446,7 +446,7 @@ test "OSC 3008: over-length context ID" {
     const testing = std.testing;
 
     var p: Parser = .init(null);
-    const id = "a" ** 65;
+    const id: [65]u8 = @splat('a');
     const input = "3008;start=" ++ id;
     for (input) |ch| p.next(ch);
     try testing.expect(p.end(null) == null);

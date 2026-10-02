@@ -53,7 +53,10 @@ test "read a file through File.Reader" {
     var tmp_dir = testing.tmpDir(.{});
     defer tmp_dir.cleanup();
 
-    const contents = "hello minimal test_io\n" ** 100;
+    const txt = "hello minimal test_io\n";
+    var contents: [txt.len * 100] = undefined;
+    for (0..100) |i| @memcpy(contents[i*txt.len..][0..txt.len], txt);
+
     try tmp_dir.dir.writeFile(testing.io, .{
         .sub_path = "test.txt",
         .data = contents,
@@ -260,7 +263,7 @@ test "openFile edge cases" {
     ));
 
     // Paths that can't fit in PATH_MAX must not be silently truncated.
-    const long_name = "a" ** (std.fs.max_path_bytes + 1);
+    const long_name: [std.fs.max_path_bytes + 1] = @splat('a');
     try testing.expectError(error.NameTooLong, dir.openFile(
         test_io,
         long_name,

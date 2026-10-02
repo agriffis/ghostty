@@ -3070,7 +3070,7 @@ test "XTGETTCAP TN responses" {
         std.fmt.bytesToHex("xterm-256color", .upper) ++ "\x1B\\");
 
     // A maximum-length name is still reported in full.
-    const max_name = "a" ** Handler.max_terminfo_name_bytes;
+    const max_name: [Handler.max_terminfo_name_bytes]u8 = @splat('a');
     s.handler.terminfo_name = max_name;
     s.nextSlice(tn_query);
     try S.expectResponse("\x1BP1+r" ++ std.fmt.bytesToHex("TN", .upper) ++ "=" ++
@@ -3084,7 +3084,8 @@ test "XTGETTCAP TN responses" {
         std.fmt.bytesToHex("256", .upper) ++ "\x1B\\");
 
     // As are names beyond the maximum length.
-    s.handler.terminfo_name = "a" ** (Handler.max_terminfo_name_bytes + 1);
+    const long_name: [Handler.max_terminfo_name_bytes + 1]u8 = @splat('a');
+    s.handler.terminfo_name = long_name;
     s.nextSlice(tn_query);
     try testing.expectEqual(@as(usize, 0), S.calls);
     try testing.expect(!s.handler.semantic_failure);
@@ -6877,7 +6878,7 @@ test "paste: large text streams to the pty in chunks" {
 
     // Two full chunks and a partial one with the frame, never the
     // whole thing at once.
-    const data = "x" ** 10_000;
+    const data: [10_000]u8 = @splat('x');
     try testing.expect(try handler.paste(.{
         .contents = .{ .memory = &.{.{ .mime = "text/plain", .data = data }} },
     }));

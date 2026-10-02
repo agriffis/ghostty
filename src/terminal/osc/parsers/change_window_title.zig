@@ -38,8 +38,8 @@ test "OSC 0: longer than buffer" {
 
     var p: Parser = .init(null);
 
-    const input = "0;" ++ "a" ** (Parser.MAX_BUF + 2);
-    for (input) |ch| p.next(ch);
+    for ("0;") |ch| p.next(ch);
+    for (0..Parser.MAX_BUF + 2) |_| p.next('a');
 
     try testing.expect(p.end(null) == null);
 }
@@ -49,10 +49,9 @@ test "OSC 0: one shorter than buffer length" {
 
     var p: Parser = .init(null);
 
-    const prefix = "0;";
-    const title = "a" ** (Parser.MAX_BUF - 1);
-    const input = prefix ++ title;
-    for (input) |ch| p.next(ch);
+    const title: [Parser.MAX_BUF - 1]u8 = @splat('a');
+    for ("0;") |ch| p.next(ch);
+    for (title) |ch| p.next(ch);
 
     const cmd = p.end(null).?.*;
     try testing.expect(cmd == .change_window_title);
@@ -64,10 +63,8 @@ test "OSC 0: exactly at buffer length" {
 
     var p: Parser = .init(null);
 
-    const prefix = "0;";
-    const title = "a" ** Parser.MAX_BUF;
-    const input = prefix ++ title;
-    for (input) |ch| p.next(ch);
+    for ("0;") |ch| p.next(ch);
+    for (0..Parser.MAX_BUF) |_| p.next('a');
 
     // This should be null because we always reserve space for a null terminator.
     try testing.expect(p.end(null) == null);
