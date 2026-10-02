@@ -354,7 +354,7 @@ else untouched: {
 /// List of pins, known as "tracked" pins. These are pins that are kept
 /// up to date automatically through page-modifying operations.
 const PinSet = std.AutoArrayHashMapUnmanaged(*Pin, void);
-const PinPool = std.heap.memory_pool.Managed(Pin);
+const PinPool = std.heap.MemoryPool(Pin);
 
 /// The pool of memory used for a pagelist. This can be shared between
 /// multiple pagelists but it is not threadsafe.
