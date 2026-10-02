@@ -25,7 +25,7 @@ pub fn build(b: *std.Build) !void {
     // If we have a VERSION file (present in source tarballs) then we
     // use that as the version source of truth. Otherwise we fall back
     // to what is in the build.zig.zon.
-    const file_version: ?[]const u8 = if (b.build_root.handle.readFileAlloc(
+    const file_version: ?[]const u8 = if (b.root.root_dir.handle.readFileAlloc(
         b.graph.io,
         "VERSION",
         b.allocator,
@@ -281,7 +281,7 @@ pub fn build(b: *std.Build) !void {
     run: {
         if (config.app_runtime != .none) {
             const run_cmd = b.addRunArtifact(exe.exe);
-            if (b.args) |args| run_cmd.addArgs(args);
+            run_cmd.addPassthruArgs();
 
             // Set the proper resources dir so things like shell integration
             // work correctly. If we're running `zig build run` in Ghostty,
@@ -352,7 +352,7 @@ pub fn build(b: *std.Build) !void {
             "--gen-suppressions=all",
         });
         run_cmd.addArtifactArg(valgrind_exe.exe);
-        if (b.args) |args| run_cmd.addArgs(args);
+        run_cmd.addPassthruArgs();
         run_valgrind_step.dependOn(&run_cmd.step);
     }
 
