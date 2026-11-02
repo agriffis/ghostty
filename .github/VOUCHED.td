@@ -88,6 +88,7 @@ cespare
 charliie-dev
 chernetskyi
 chronologos
+clavinjune
 clemg
 clinta
 cmwetherell
@@ -245,6 +246,7 @@ mac0ne
 maddythewisp
 magnussp
 mahnokropotkinvich
+mangkoran
 marijagjorgjieva
 markdorison
 markhuot
