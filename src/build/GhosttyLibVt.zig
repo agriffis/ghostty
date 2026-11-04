@@ -28,6 +28,12 @@ dsym: ?std.Build.LazyPath,
 pkg_config: ?std.Build.LazyPath,
 pkg_config_static: ?std.Build.LazyPath,
 
+/// The CMake package config files that let CMake projects use
+/// `find_package(ghostty-vt)`. One config describes both the shared and
+/// static library, so it is generated with the shared library only and
+/// is null for every other kind.
+cmake: ?CMakeFiles,
+
 /// The kind of library being built. This is similar to LinkMode but
 /// also includes wasm which is an executable, not a library.
 const Kind = enum {
@@ -95,6 +101,7 @@ pub fn initWasm(
         .dsym = null,
         .pkg_config = null,
         .pkg_config_static = null,
+        .cmake = null,
     };
 }
 
@@ -183,6 +190,7 @@ pub fn initStaticAppleUniversal(
         .dsym = null,
         .pkg_config = null,
         .pkg_config_static = null,
+        .cmake = null,
     });
 
     // Additional Apple platforms, each gated on SDK availability.
@@ -321,6 +329,10 @@ fn initLib(
         try pkgConfigFiles(b, zig, target.result.os.tag)
     else
         null;
+    const cmake: ?CMakeFiles = if (kind == .shared)
+        .init(b, zig, target.result)
+    else
+        null;
 
     // For static libraries with vendored SIMD dependencies, combine
     // all archives into a single fat archive so consumers only need
@@ -353,6 +365,7 @@ fn initLib(
             .dsym = dsymutil,
             .pkg_config = if (pcs) |v| v.shared else null,
             .pkg_config_static = if (pcs) |v| v.static else null,
+            .cmake = cmake,
         };
     }
 
@@ -376,6 +389,7 @@ fn initLib(
         .dsym = dsymutil,
         .pkg_config = if (pcs) |v| v.shared else null,
         .pkg_config_static = if (pcs) |v| v.static else null,
+        .cmake = cmake,
     };
 }
 
@@ -424,6 +438,16 @@ fn initLibApple(
     });
     // Restrict exports to libghostty-vt's public C ABI.
     native_link.addPrefixedFileArg("-Wl,-exported_symbols_list,", exports);
+    // With -Dstrip, the objects in the archive have no debug info, but
+    // Apple's linker still copies their internal symbol names into the
+    // dylib. These flags tell it to leave those out as well.
+    if (zig.vt_c.strip orelse false) native_link.addArgs(&.{
+        // Leave out the debug map, which points debuggers at the
+        // original object files.
+        "-Wl,-S",
+        // Leave out symbols that aren't exported.
+        "-Wl,-x",
+    });
     // Link the archive produced by the normal static-library path.
     native_link.addFileArg(static.output);
     native_link.addArgs(&.{
@@ -497,6 +521,7 @@ fn initLibApple(
         .dsym = dsym,
         .pkg_config = pcs.shared,
         .pkg_config_static = pcs.static,
+        .cmake = .init(b, zig, target.result),
     };
 }
 
@@ -622,6 +647,222 @@ fn staticLibraryName(os_tag: std.Target.Os.Tag) []const u8 {
         "libghostty-vt.a";
 }
 
+/// The file names the shared library is installed under, which the CMake
+/// config needs to point at the right files. They follow the naming
+/// policy documented on `SharedVersion`.
+///
+/// For version 0.1.0, the names are:
+///
+///     Linux:   real = "libghostty-vt.so.0.1.0", soname = "libghostty-vt.so.0"
+///     macOS:   real = "libghostty-vt.0.1.0.dylib", soname = "libghostty-vt.0.dylib"
+///     Windows: real = "ghostty-vt.dll", implib = "ghostty-vt.lib"
+///
+/// On macOS the config adds the "@rpath/" prefix to the soname itself.
+const SharedLibraryNames = struct {
+    /// The library file itself. On Windows this is the DLL, which is
+    /// installed to bin/. Everywhere else it is in lib/.
+    real: []const u8,
+
+    /// The name a program records when it links against the library,
+    /// and looks for again at run time. Null on Windows.
+    soname: ?[]const u8,
+
+    /// The import library that programs link against on Windows,
+    /// installed to lib/. Null everywhere else.
+    implib: ?[]const u8,
+
+    /// Returns the installed shared library names for `os_tag`.
+    fn init(
+        b: *std.Build,
+        version: std.SemanticVersion,
+        os_tag: std.Target.Os.Tag,
+    ) SharedLibraryNames {
+        if (os_tag == .windows) return .{
+            .real = "ghostty-vt.dll",
+            .soname = null,
+            .implib = "ghostty-vt.lib",
+        };
+
+        if (os_tag.isDarwin()) {
+            const shared_version: SharedVersion = .init(b, version);
+            return .{
+                .real = shared_version.real_name,
+                .soname = shared_version.major_name,
+                .implib = null,
+            };
+        }
+
+        return .{
+            .real = b.fmt("libghostty-vt.so.{d}.{d}.{d}", .{
+                version.major,
+                version.minor,
+                version.patch,
+            }),
+            .soname = b.fmt("libghostty-vt.so.{d}", .{version.major}),
+            .implib = null,
+        };
+    }
+};
+
+/// The two files CMake looks for when a project calls
+/// `find_package(ghostty-vt)`.
+const CMakeFiles = struct {
+    /// `ghostty-vt-config.cmake`, which defines the imported targets
+    /// `ghostty-vt::ghostty-vt` (shared) and `ghostty-vt::ghostty-vt-static`.
+    config: std.Build.LazyPath,
+
+    /// `ghostty-vt-config-version.cmake`, which CMake uses to check
+    /// that this install matches the version the project asked for.
+    version: std.Build.LazyPath,
+
+    /// Generates the CMake package config for `find_package(ghostty-vt)`.
+    ///
+    /// The config is made from the same template that the CMake wrapper
+    /// (the top-level CMakeLists.txt) uses, so a `zig build` install and a
+    /// `cmake --install` define the same targets.
+    ///
+    /// Every path in the generated config is relative to the config file
+    /// itself, so nothing depends on the absolute install prefix. This
+    /// means the install still works if it is staged with `DESTDIR` or
+    /// moved somewhere else afterward. For example, a config installed at
+    ///
+    ///     /opt/ghostty/lib/cmake/ghostty-vt/ghostty-vt-config.cmake
+    ///
+    /// finds the prefix by going up three directories to `/opt/ghostty`,
+    /// and expects the library and headers in `/opt/ghostty/lib` and
+    /// `/opt/ghostty/include`. This relies on `install` using that fixed
+    /// layout (bin/, include/, lib/ and lib/cmake/ghostty-vt/).
+    fn init(
+        b: *std.Build,
+        zig: *const GhosttyZig,
+        target: std.Target,
+    ) CMakeFiles {
+        const names: SharedLibraryNames = .init(b, zig.version, target.os.tag);
+
+        const generator = b.addExecutable(.{
+            .name = "configure_file",
+            .root_module = b.createModule(.{
+                .root_source_file = b.path("src/build/configure_file.zig"),
+                .target = b.graph.host,
+            }),
+        });
+        const run = b.addRunArtifact(generator);
+        run.addFileArg(b.path("dist/cmake/ghostty-vt-config.cmake.in"));
+        run.addArgs(&.{
+            // CMake's configure_package_config_file() replaces @PACKAGE_INIT@
+            // with setup code. This is the same code for a config three
+            // directories below the prefix. It sets PACKAGE_PREFIX_DIR and
+            // defines check_required_components(), which the template calls
+            // at the end.
+            //
+            // CMake's version also has a fallback for installs where /usr is
+            // a symlink to another directory. That fallback needs the
+            // absolute install path, which this build can't know, so it is
+            // left out.
+            "PACKAGE_INIT=" ++
+                \\get_filename_component(PACKAGE_PREFIX_DIR "${CMAKE_CURRENT_LIST_DIR}/../../../" ABSOLUTE)
+                \\
+                \\macro(check_required_components _NAME)
+                \\  foreach(comp ${${_NAME}_FIND_COMPONENTS})
+                \\    if(NOT ${_NAME}_${comp}_FOUND)
+                \\      if(${_NAME}_FIND_REQUIRED_${comp})
+                \\        set(${_NAME}_FOUND FALSE)
+                \\      endif()
+                \\    endif()
+                \\  endforeach()
+                \\endmacro()
+            ,
+            "CMAKE_INSTALL_BINDIR=bin",
+            "CMAKE_INSTALL_INCLUDEDIR=include",
+            "CMAKE_INSTALL_LIBDIR=lib",
+            b.fmt("GHOSTTY_VT_REALNAME={s}", .{names.real}),
+            b.fmt("GHOSTTY_VT_SONAME={s}", .{names.soname orelse ""}),
+            b.fmt("GHOSTTY_VT_IMPLIB={s}", .{names.implib orelse ""}),
+            b.fmt("GHOSTTY_VT_STATIC_REALNAME={s}", .{staticLibraryName(target.os.tag)}),
+        });
+
+        // This file matches what CMake's write_basic_package_version_file()
+        // writes with COMPATIBILITY SameMajorVersion, which is what the
+        // CMake wrapper uses. An install of 0.1.2 satisfies a request for
+        // 0.1 or 0.1.1, but not 1.0 or 0.2.
+        //
+        // The version is written without any pre-release suffix (such as
+        // "-dev") because CMake can't compare versions that have one.
+        //
+        // The file also rejects an install built for a different pointer
+        // size, such as a 32-bit library found by a 64-bit project.
+        const version = b.fmt("{d}.{d}.{d}", .{
+            zig.version.major,
+            zig.version.minor,
+            zig.version.patch,
+        });
+        const ptr_size = target.ptrBitWidth() / 8;
+        const version_file = b.addWriteFiles().add(
+            "ghostty-vt-config-version.cmake",
+            b.fmt(
+                \\# Generated by `zig build`. Equivalent to CMake's
+                \\# write_basic_package_version_file(COMPATIBILITY SameMajorVersion).
+                \\
+                \\set(PACKAGE_VERSION "{[version]s}")
+                \\
+                \\if(PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION)
+                \\  set(PACKAGE_VERSION_COMPATIBLE FALSE)
+                \\else()
+                \\  set(CVF_VERSION_MAJOR "{[major]d}")
+                \\
+                \\  if(PACKAGE_FIND_VERSION_RANGE)
+                \\    # both endpoints of the range must have the expected major version
+                \\    math (EXPR CVF_VERSION_MAJOR_NEXT "${{CVF_VERSION_MAJOR}} + 1")
+                \\    if (NOT PACKAGE_FIND_VERSION_MIN_MAJOR STREQUAL CVF_VERSION_MAJOR
+                \\        OR ((PACKAGE_FIND_VERSION_RANGE_MAX STREQUAL "INCLUDE" AND NOT PACKAGE_FIND_VERSION_MAX_MAJOR STREQUAL CVF_VERSION_MAJOR)
+                \\          OR (PACKAGE_FIND_VERSION_RANGE_MAX STREQUAL "EXCLUDE" AND NOT PACKAGE_FIND_VERSION_MAX VERSION_LESS_EQUAL CVF_VERSION_MAJOR_NEXT)))
+                \\      set(PACKAGE_VERSION_COMPATIBLE FALSE)
+                \\    elseif(PACKAGE_FIND_VERSION_MIN_MAJOR STREQUAL CVF_VERSION_MAJOR
+                \\        AND ((PACKAGE_FIND_VERSION_RANGE_MAX STREQUAL "INCLUDE" AND PACKAGE_VERSION VERSION_LESS_EQUAL PACKAGE_FIND_VERSION_MAX)
+                \\        OR (PACKAGE_FIND_VERSION_RANGE_MAX STREQUAL "EXCLUDE" AND PACKAGE_VERSION VERSION_LESS PACKAGE_FIND_VERSION_MAX)))
+                \\      set(PACKAGE_VERSION_COMPATIBLE TRUE)
+                \\    else()
+                \\      set(PACKAGE_VERSION_COMPATIBLE FALSE)
+                \\    endif()
+                \\  else()
+                \\    if(PACKAGE_FIND_VERSION_MAJOR STREQUAL CVF_VERSION_MAJOR)
+                \\      set(PACKAGE_VERSION_COMPATIBLE TRUE)
+                \\    else()
+                \\      set(PACKAGE_VERSION_COMPATIBLE FALSE)
+                \\    endif()
+                \\
+                \\    if(PACKAGE_FIND_VERSION STREQUAL PACKAGE_VERSION)
+                \\      set(PACKAGE_VERSION_EXACT TRUE)
+                \\    endif()
+                \\  endif()
+                \\endif()
+                \\
+                \\# if the installed or the using project don't have CMAKE_SIZEOF_VOID_P set, ignore it:
+                \\if("${{CMAKE_SIZEOF_VOID_P}}" STREQUAL "")
+                \\  return()
+                \\endif()
+                \\
+                \\# check that the installed version has the same 32/64bit-ness as the one which is currently searching:
+                \\if(NOT CMAKE_SIZEOF_VOID_P STREQUAL "{[ptr_size]d}")
+                \\  math(EXPR installedBits "{[ptr_size]d} * 8")
+                \\  set(PACKAGE_VERSION "${{PACKAGE_VERSION}} (${{installedBits}}bit)")
+                \\  set(PACKAGE_VERSION_UNSUITABLE TRUE)
+                \\endif()
+                \\
+            , .{
+                .version = version,
+                .major = zig.version.major,
+                .ptr_size = ptr_size,
+            }),
+        );
+
+        return .{
+            .config = run.captureStdOut(.{}),
+            .version = version_file,
+        };
+    }
+};
+
 /// Returns the Requires.private value for the pkg-config file.
 /// When SIMD dependencies are provided by the system (via
 /// -Dsystem-integration), we reference their pkg-config names so
@@ -704,18 +945,35 @@ pub fn install(
 ) void {
     const b = step.owner;
     step.dependOn(self.artifact);
+    // The pkg-config files go in lib/pkgconfig rather than
+    // share/pkgconfig. share/ is meant for files that are the same on
+    // every architecture, and these name the library's directory, which
+    // can differ between architectures. Both these files and the CMake
+    // files expect the library to be in lib/ under the prefix.
     if (self.pkg_config) |pkg_config| {
         step.dependOn(&b.addInstallFileWithDir(
             pkg_config,
             .prefix,
-            "share/pkgconfig/libghostty-vt.pc",
+            "lib/pkgconfig/libghostty-vt.pc",
         ).step);
     }
     if (self.pkg_config_static) |pkg_config_static| {
         step.dependOn(&b.addInstallFileWithDir(
             pkg_config_static,
             .prefix,
-            "share/pkgconfig/libghostty-vt-static.pc",
+            "lib/pkgconfig/libghostty-vt-static.pc",
+        ).step);
+    }
+    if (self.cmake) |cmake| {
+        step.dependOn(&b.addInstallFileWithDir(
+            cmake.config,
+            .prefix,
+            "lib/cmake/ghostty-vt/ghostty-vt-config.cmake",
+        ).step);
+        step.dependOn(&b.addInstallFileWithDir(
+            cmake.version,
+            .prefix,
+            "lib/cmake/ghostty-vt/ghostty-vt-config-version.cmake",
         ).step);
     }
 }
