@@ -1231,7 +1231,7 @@ pub fn clone(
     }
 
     // A clone can copy more history than its inherited line limit.
-    result.limits.enforce(&result, .lines);
+    result.limits.enforce(&result, .lines, .reclaim);
 
     result.assertIntegrity();
     return result;
@@ -1301,7 +1301,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         try self.resizeWithoutReflow(opts);
         // Shrinking the active row count turns former active rows into
         // scrollback even without reflow, which can cross the line limit.
-        self.limits.enforce(self, .lines);
+        self.limits.enforce(self, .lines, .reclaim);
         return;
     }
 
@@ -1331,12 +1331,24 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
         .lt => {
             // We first change our row count so that we have the proper amount
             // we can use when shrinking our cols.
+            const old_active_top = self.total_rows - self.rows;
             try self.resizeWithoutReflow(opts: {
                 var copy = opts;
                 copy.cols = self.cols;
                 break :opts copy;
             });
-            try self.resizeCols(cols, opts);
+
+            // Changing the row count doesn't move any content, only the top of
+            // the active area (e.g. when pulling down scrollback), so the
+            // cursor's row in the active area moves by the opposite amount.
+            var cols_opts = opts;
+            if (cols_opts.cursor) |*c| {
+                const screen_y = old_active_top + c.y;
+                const new_active_top = self.total_rows - self.rows;
+                if (screen_y >= new_active_top) c.y = @intCast(screen_y - new_active_top);
+            }
+
+            try self.resizeCols(cols, cols_opts);
         },
     }
 
@@ -1353,7 +1365,7 @@ pub fn resize(self: *PageList, opts: Resize) Allocator.Error!void {
     // Column reflow can change the physical history row count, and a row
     // resize can move the active boundary. Both may expose whole old pages
     // that are now eligible for line-limit pruning.
-    self.limits.enforce(self, .lines);
+    self.limits.enforce(self, .lines, .reclaim);
 }
 
 /// Resize the pagelist with reflow by adding or removing columns.
@@ -2374,10 +2386,11 @@ const ReflowCursor = struct {
                 // call fails so we aren't leaking memory.
                 dst_link.free(self.page);
 
-                // If the add failed then either the set needs to grow
-                // or it needs to be rehashed. Either one of those can
-                // be accomplished by increasing capacity, either with
-                // no actual change or with an increased hyperlink cap.
+                // If the add failed then the set needs to grow, which
+                // increasing the hyperlink cap does. `NeedsRehash` only
+                // happens if the set's bookkeeping is wrong (safe builds
+                // panic instead), and increasing capacity with no
+                // actual change rebuilds it.
                 try self.increaseCapacity(list, switch (err) {
                     error.OutOfMemory => .hyperlink_bytes,
                     error.NeedsRehash => null,
@@ -2488,10 +2501,11 @@ const ReflowCursor = struct {
                 style,
                 cell.style_id,
             ) catch |err| id: {
-                // If the add failed then either the set needs to grow
-                // or it needs to be rehashed. Either one of those can
-                // be accomplished by increasing capacity, either with
-                // no actual change or with an increased style cap.
+                // If the add failed then the set needs to grow, which
+                // increasing the style cap does. `NeedsRehash` only
+                // happens if the set's bookkeeping is wrong (safe builds
+                // panic instead), and increasing capacity with no
+                // actual change rebuilds it.
                 try self.increaseCapacity(list, switch (err) {
                     error.OutOfMemory => .styles,
                     error.NeedsRehash => null,
@@ -3068,33 +3082,46 @@ fn resizeWithoutReflowGrowCols(
             page.size.rows,
         );
 
+        const prev_start = prev_page.size.rows;
         const src_rows = page.rows.ptr(page.memory)[0..len];
-        const dst_rows = prev_page.rows.ptr(prev_page.memory)[prev_page.size.rows..];
-        for (dst_rows, src_rows) |*dst_row, *src_row| {
-            prev_page.size.rows += 1;
-            copied += 1;
-            prev_page.cloneRowFrom(
-                page,
-                dst_row,
-                src_row,
-            ) catch {
-                // If an error happens, we undo our row copy and break out
-                // into creating a new page.
-                prev_page.size.rows -= 1;
-                copied -= 1;
-                break :prev;
-            };
+        const dst_rows = prev_page.rows.ptr(prev_page.memory)[prev_start..];
+        {
+            // As in Page.cloneFrom, check the page once after the loop
+            // rather than after every row.
+            prev_page.pauseIntegrityChecks(true);
+            defer prev_page.pauseIntegrityChecks(false);
+            for (dst_rows, src_rows) |*dst_row, *src_row| {
+                prev_page.size.rows += 1;
+                prev_page.cloneRowFrom(
+                    page,
+                    dst_row,
+                    src_row,
+                ) catch {
+                    // If an error happens, we undo this row's partial copy
+                    // and stop. The rows copied so far stay in prev and the
+                    // rest go into new pages below. The retired row must be
+                    // left in the default state (see resetRow).
+                    prev_page.resetRow(dst_row);
+                    prev_page.size.rows -= 1;
+                    break;
+                };
+                copied += 1;
+            }
         }
+        prev_page.assertIntegrity();
 
-        assert(copied == len);
+        assert(copied <= len);
         assert(prev_page.size.rows <= prev_page.capacity.rows);
 
-        // Remap any tracked pins that pointed to rows we just copied to prev.
+        // Remap any tracked pins that pointed to rows we just copied to
+        // prev. This must also run when the copy stopped early, since the
+        // loop below only remaps the rows it copies and the source page
+        // is destroyed at the end.
         const pin_keys = self.tracked_pins.keys();
         for (pin_keys) |p| {
-            if (p.node != chunk.node or p.y >= len) continue;
+            if (p.node != chunk.node or p.y >= copied) continue;
             p.node = prev_node;
-            p.y += prev_page.size.rows - len;
+            p.y += prev_start;
         }
     }
 
@@ -3125,6 +3152,12 @@ fn resizeWithoutReflowGrowCols(
         const new_node = try self.createPage(.{ .cap = cap });
         const new_page = new_node.page();
         defer new_page.assertIntegrity();
+
+        // Check the page once when it is full, not after every row.
+        // Defers run in reverse order, so the pause ends before the
+        // check above runs.
+        new_page.pauseIntegrityChecks(true);
+        defer new_page.pauseIntegrityChecks(false);
 
         // The length we can copy into the new page is at most the number
         // of rows in our cap. But if we can finish our source page we use that.
@@ -3265,7 +3298,7 @@ fn trimTrailingBlankRows(
 
         row_pin.node.page().size.rows -= 1;
         if (row_pin.node.page().size.rows == 0) {
-            self.erasePage(row_pin.node);
+            self.erasePage(row_pin.node, .reclaim);
         } else {
             row_pin.node.page().assertIntegrity();
         }
@@ -4001,7 +4034,7 @@ pub fn setMaxBytes(self: *PageList, max: ?usize) void {
     defer self.assertIntegrity();
 
     self.limits.set(.bytes, max);
-    self.limits.enforce(self, .bytes);
+    self.limits.enforce(self, .bytes, .reclaim);
     if (self.limits.bytes.explicit == 0) self.viewport = .active;
 }
 
@@ -4015,7 +4048,7 @@ pub fn setMaxLines(self: *PageList, max: ?usize) void {
     defer self.assertIntegrity();
 
     self.limits.set(.lines, max);
-    self.limits.enforce(self, .lines);
+    self.limits.enforce(self, .lines, .reclaim);
 }
 
 /// Grow the active area by exactly one row.
@@ -4048,7 +4081,10 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
 
         // Growing inside the last page moves the active boundary without
         // allocating; that alone can make the first page wholly historical.
-        self.limits.enforce(self, .lines);
+        // At a steady line limit this prunes one page for every page of
+        // output, and the next new page takes the pruned item straight
+        // back out of the pool, so keep its memory.
+        self.limits.enforce(self, .lines, .retain);
         return null;
     }
 
@@ -4178,11 +4214,11 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
         // pruning would have cut into the active area (see the trimming
         // costs in growCapacity). Reuse swaps one pool item for another,
         // so it can't fix that on its own. Enforce the limit here.
-        self.limits.enforce(self, .bytes);
+        self.limits.enforce(self, .bytes, .reclaim);
 
         // Byte-limit recycling may leave history above the independent line
         // limit, so enforce it after the recycled page becomes the new tail.
-        self.limits.enforce(self, .lines);
+        self.limits.enforce(self, .lines, .reclaim);
         return first;
     }
 
@@ -4204,11 +4240,12 @@ pub fn grow(self: *PageList) Allocator.Error!?*List.Node {
     // item, while a heap page is as large as its capacity. If a larger
     // page replaced a smaller one we can be over the byte limit, so
     // remove more history until we are back under it.
-    self.limits.enforce(self, .bytes);
+    self.limits.enforce(self, .bytes, .reclaim);
 
     // Appending a page can cross the line limit and can make the oldest
-    // active-boundary page wholly historical.
-    self.limits.enforce(self, .lines);
+    // active-boundary page wholly historical. As in the fast path above,
+    // the next new page reuses the pruned item, so keep its memory.
+    self.limits.enforce(self, .lines, .retain);
     return next_node;
 }
 
@@ -4929,6 +4966,7 @@ pub const PageAllocation = struct {
             &self.destination.pool,
             node,
             null,
+            .reclaim,
         );
         self.node = null;
     }
@@ -5601,13 +5639,29 @@ fn compressPage(self: *PageList, node: *List.Node) bool {
 /// responsible for accounting for the removed rows. This function only
 /// updates `page_size` (byte accounting), not row accounting.
 fn destroyNode(self: *PageList, node: *List.Node) void {
-    destroyNodeExt(&self.pool, node, &self.page_size);
+    destroyNodeExt(&self.pool, node, &self.page_size, .reclaim);
 }
+
+/// What `destroyNodeExt` does with the memory of a pool-owned page
+/// that goes back to the pool's free list.
+const DestroyMode = enum {
+    /// Give the physical memory back to the OS and keep only the
+    /// address range (see `terminal_mem.decommit`). This is right when
+    /// the page list is shrinking and the item may sit unused.
+    reclaim,
+
+    /// Zero the memory and keep it. This is for callers that expect the
+    /// pool to hand the item out again right away. Giving it back to the
+    /// OS only to take it back costs system calls and, on Linux, a page
+    /// fault for every OS page of the item.
+    retain,
+};
 
 fn destroyNodeExt(
     pool: *MemoryPool,
     node: *List.Node,
     total_size: ?*usize,
+    mode: DestroyMode,
 ) void {
     const page = node.restore(.discard);
 
@@ -5628,8 +5682,9 @@ fn destroyNodeExt(
                 @ptrCast(@alignCast(page.memory.ptr));
 
             // A pooled page gets here only when `grow` could not reuse
-            // its item in place: `increaseCapacity` replaced it, or a
-            // heap page took its place at the byte limit. Keep a few
+            // its item in place: `increaseCapacity` replaced it, a heap
+            // page took its place at the byte limit, or the line limit
+            // pruned it (see `DestroyMode.retain`). Keep a few
             // zeroed items for reuse and give the rest back to the OS.
             // A decommitted item is still mapped and, on Darwin, stays
             // resident until the kernel needs the memory, so an
@@ -5644,9 +5699,17 @@ fn destroyNodeExt(
                     }
                 }
 
-                // Reset the memory to zero (and decommit it, where
-                // supported) so it can be reused.
-                _ = terminal_mem.decommit(.zero, item, page.memory.len);
+                // Reset the memory to zero so it can be reused. Unless
+                // the caller wants it kept, also decommit it where
+                // supported.
+                switch (mode) {
+                    .reclaim => _ = terminal_mem.decommit(
+                        .zero,
+                        item,
+                        page.memory.len,
+                    ),
+                    .retain => @memset(page.memory, 0),
+                }
                 pool.pages.destroy(item);
             }
         },
@@ -6114,7 +6177,7 @@ fn eraseRows(
             if (discard) for (self.tracked_pins.keys()) |p| {
                 if (p.node == chunk.node) p.garbage = true;
             };
-            self.erasePage(chunk.node);
+            self.erasePage(chunk.node, .reclaim);
             continue;
         }
 
@@ -6197,7 +6260,7 @@ fn eraseRows(
 /// IMPORTANT: This function does NOT update `total_rows`. The caller is
 /// responsible for accounting for the removed rows before or after calling
 /// this function.
-fn erasePage(self: *PageList, node: *List.Node) void {
+fn erasePage(self: *PageList, node: *List.Node, mode: DestroyMode) void {
     // Must not be the final page.
     assert(node.next != null or node.prev != null);
 
@@ -6219,7 +6282,7 @@ fn erasePage(self: *PageList, node: *List.Node) void {
 
     // Remove the page from the linked list
     self.pages.remove(node);
-    self.destroyNode(node);
+    destroyNodeExt(&self.pool, node, &self.page_size, mode);
 }
 
 /// Returns the pin for the given point. The pin is NOT tracked so it
@@ -7615,6 +7678,7 @@ const Limits = struct {
         self: *const Limits,
         pagelist: *PageList,
         key: Key,
+        mode: DestroyMode,
     ) void {
         if (!self.exceeded(pagelist, key)) return;
 
@@ -7647,7 +7711,7 @@ const Limits = struct {
             // erasePage updates the list, pin targets, and byte accounting.
             // Row accounting belongs to the caller because erasePage is also used
             // by paths that already adjusted total_rows.
-            pagelist.erasePage(first);
+            pagelist.erasePage(first, mode);
             pagelist.total_rows -= first_rows;
             removed += first_rows;
         }
@@ -8175,6 +8239,7 @@ pub const Builder = struct {
             &self.pool,
             node,
             &self.page_size,
+            .reclaim,
         );
         // Free memory pool
         self.pool.deinit();
@@ -20935,6 +21000,123 @@ test "PageList resize (no reflow) more cols remaps pins in backfill path" {
     const cell = tracked.rowAndCell().cell;
     try testing.expectEqual(.codepoint, cell.content_tag);
     try testing.expectEqual(marker, cell.content.codepoint.data);
+}
+
+test "PageList resize (no reflow) more cols remaps viewport pin when backfill stops early" {
+    // Regression test: the backfill in resizeWithoutReflowGrowCols stops
+    // at the first row that doesn't fit in the previous page (here, its
+    // graphemes exceed that page's capacity). The rows copied before it
+    // must still have their tracked pins remapped, or a viewport scrolled
+    // onto one of them is left on the destroyed page.
+    const testing = std.testing;
+    const alloc = testing.allocator;
+
+    const cols: size.CellCountInt = 5;
+    const new_cols: size.CellCountInt = cols + 1;
+    const new_cap = try std_capacity.adjust(.{ .cols = new_cols });
+
+    var s = try init(alloc, .{ .cols = cols, .rows = 10 });
+    defer s.deinit();
+
+    // Three pages with the active area entirely in the last one. In Debug
+    // builds every grow checks the whole last page, so filling a page one
+    // row at a time checks it thousands of times. Pause each page's checks
+    // while it fills, and check it once when the next page starts.
+    {
+        var cur = s.pages.last.?;
+        cur.page().pauseIntegrityChecks(true);
+        while (s.totalPages() < 3) {
+            if (try s.grow()) |new_node| {
+                cur.page().pauseIntegrityChecks(false);
+                cur.page().assertIntegrity();
+                cur = new_node;
+                cur.page().pauseIntegrityChecks(true);
+            }
+        }
+        cur.page().pauseIntegrityChecks(false);
+        cur.page().assertIntegrity();
+    }
+    for (0..s.rows) |_| _ = try s.grow();
+    try testing.expectEqual(3, s.totalPages());
+
+    // Leave the first page one row longer than a page at the new width
+    // holds, so its copy ends in a one-row page with spare capacity that
+    // the second page backfills.
+    {
+        const first = s.pages.first.?;
+        try testing.expect(first.rows() > new_cap.rows + 1);
+        s.eraseHistory(.{ .history = .{
+            .y = first.rows() - (new_cap.rows + 1) - 1,
+        } });
+        try testing.expectEqual(first, s.pages.first.?);
+        try testing.expectEqual(new_cap.rows + 1, first.rows());
+    }
+
+    // Give the second page more grapheme capacity than the backfill
+    // target has and fill its row 1 past the target's capacity. Row 0
+    // is plain, so the backfill copies it and then stops at row 1.
+    const cps: [64]u21 = @splat(0x0301);
+    const second = second: {
+        var node = s.pages.first.?.next.?;
+        for (0..3) |_| node = try s.increaseCapacity(node, .grapheme_bytes);
+        break :second node;
+    };
+    {
+        const page = second.page();
+        const rac = page.getRowAndCell(0, 0);
+        rac.cell.* = .{
+            .content_tag = .codepoint,
+            .content = .{ .codepoint = .{ .data = 'X' } },
+        };
+
+        for (0..cols) |x| {
+            const g = page.getRowAndCell(x, 1);
+            g.cell.* = .{
+                .content_tag = .codepoint,
+                .content = .{ .codepoint = .{ .data = 'G' } },
+            };
+            try page.setGraphemes(g.row, g.cell, &cps);
+        }
+    }
+
+    // Scroll the viewport to the row the backfill copies.
+    s.scroll(.{ .pin = .{ .node = second, .y = 0 } });
+    try testing.expect(s.viewport == .pin);
+    const offset = s.scrollbar().offset;
+
+    try s.resize(.{ .cols = new_cols, .reflow = false });
+
+    // The viewport is still on the same row, in a live page.
+    try testing.expect(s.viewport == .pin);
+    try testing.expectEqual(offset, s.scrollbar().offset);
+    {
+        const cell = s.viewport_pin.rowAndCell().cell;
+        try testing.expectEqual('X', cell.content.codepoint.data);
+    }
+
+    // The backfilled page ends at the viewport row. The row that didn't
+    // fit was retired from it in the default state, without leaking the
+    // graphemes it partially copied.
+    {
+        const node = s.viewport_pin.node;
+        const page = node.page();
+        try testing.expectEqual(s.viewport_pin.y + 1, node.rows());
+        const retired = &page.rows.ptr(page.memory)[node.rows()];
+        try testing.expect(!retired.managedMemory());
+        try testing.expectEqual(0, page.graphemeCount());
+    }
+
+    // The row that didn't fit keeps its graphemes in the next page.
+    {
+        const p = s.viewport_pin.down(1).?;
+        try testing.expect(p.node != s.viewport_pin.node);
+        const rac = p.rowAndCell();
+        try testing.expectEqual('G', rac.cell.content.codepoint.data);
+        try testing.expectEqual(
+            cps.len,
+            p.node.page().lookupGrapheme(rac.cell).?.len,
+        );
+    }
 }
 
 test "PageList compact pool page produces exact-size heap page" {
